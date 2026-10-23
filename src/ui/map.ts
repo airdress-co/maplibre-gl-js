@@ -868,6 +868,12 @@ export class Map extends Evented<MapEventType> {
         const shouldConstrainUsingMercatorTransform = styleProjectionType !== 'globe' && !getRegisteredProjection(styleProjectionType);
         this.resize(null, shouldConstrainUsingMercatorTransform);
 
+        // The bounds were fitted before the style's projection was known. Fit them again once it is,
+        // unless the camera has moved since.
+        if (resolvedOptions.bounds && resolvedOptions.style && !this._hash) {
+            this._fitBoundsOnStyleLoad(resolvedOptions.bounds, resolvedOptions.fitBoundsOptions);
+        }
+
         this._localIdeographFontFamily = resolvedOptions.localIdeographFontFamily;
         this._validateStyle = resolvedOptions.validateStyle;
         this._initialGlobalState = resolvedOptions.globalState;
@@ -897,6 +903,24 @@ export class Map extends Evented<MapEventType> {
         });
         this.on('dataabort', (event: MapSourceDataEvent | MapStyleDataEvent) => {
             this.fire(new MapSourceDataEvent('sourcedataabort', event));
+        });
+    }
+
+    /**
+     * @internal
+     * Fits `bounds` again when the first style has loaded, unless the camera moved before that.
+     * @param bounds - The bounds given to the constructor.
+     * @param fitBoundsOptions - The constructor's fit options.
+     */
+    _fitBoundsOnStyleLoad(bounds: LngLatBoundsLike, fitBoundsOptions?: FitBoundsOptions): void {
+        let moved = false;
+        const onMoveStart = () => { moved = true; };
+        this.once('movestart', onMoveStart);
+        this.once('style.load', () => {
+            this.off('movestart', onMoveStart);
+            if (!moved) {
+                this.fitBounds(bounds, extend({}, fitBoundsOptions, {duration: 0}));
+            }
         });
     }
 

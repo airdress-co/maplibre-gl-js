@@ -2,7 +2,7 @@ import Point from '@mapbox/point-geometry';
 import {cameraBoundsWarning, type CameraForBoxAndBearingHandlerResult, type EaseToHandlerResult, type EaseToHandlerOptions, type FlyToHandlerResult, type FlyToHandlerOptions, type ICameraHelper, type MapControlsDeltas, updateRotation, cameraForBoxAndBearing} from './camera_helper.ts';
 import {LngLat, type LngLatLike} from '../lng_lat.ts';
 import {angularCoordinatesToSurfaceVector, computeGlobePanCenter, getGlobeRadiusPixels, getZoomAdjustment, globeDistanceOfLocationsPixels, interpolateLngLatForGlobe, versorSetLocationAtPoint} from './globe_utils.ts';
-import {clamp, createVec3f64, differenceOfAnglesDegrees, lerp, remapSaturate, rollPitchBearingEqual, scaleZoom, warnOnce, zoomScale} from '../../util/util.ts';
+import {clamp, createVec3f64, degreesToRadians, differenceOfAnglesDegrees, lerp, remapSaturate, rollPitchBearingEqual, scaleZoom, warnOnce, zoomScale} from '../../util/util.ts';
 import {type mat4, vec3} from 'gl-matrix';
 import {normalizeCenter} from '../transform_helper.ts';
 import {interpolates} from '@maplibre/maplibre-gl-style-spec';
@@ -38,6 +38,82 @@ const INTERPOLATE_TO_HEURISTIC_START_HORIZON = 0.95;
 
 /** Ray distance at which the blend to heuristic zooming is complete. */
 const INTERPOLATE_TO_HEURISTIC_END_HORIZON = 0.999;
+
+/** Points sampled along each edge of the bounds when fitting them: a long edge bulges on the sphere, rarely at its midpoint. */
+const FIT_SAMPLES_PER_EDGE = 8;
+
+/** Most Newton steps of a fit on the sphere. A country settles in two or three. */
+const FIT_MAX_ITERATIONS = 8;
+
+/** The finite-difference step of a fit on the sphere, for the center in pixels and for the zoom. */
+const FIT_DIFFERENCE_PIXELS = 1;
+const FIT_DIFFERENCE_ZOOM = 0.01;
+
+/** The largest zoom step of a fit on the sphere. */
+const FIT_MAX_STEP_ZOOM = 1;
+
+/** How much more a fit on the sphere weighs bounds reaching past the padded viewport than bounds short of it. */
+const FIT_OUTSIDE_WEIGHT = 10;
+
+/** The largest center step of a fit, as a fraction of the globe's radius on screen. */
+const FIT_MAX_STEP_GLOBE_RADII = 0.2;
+
+/** A fit on the sphere is settled when the bounds are this close, in pixels, to centred and to filling the padded viewport. */
+const FIT_TOLERANCE_PIXELS = 0.25;
+
+/**
+ * The direction of the mean of the points on the unit sphere, as a location, or undefined if they cancel out.
+ */
+function sphericalMiddle(points: LngLat[]): LngLat | undefined {
+    let x = 0, y = 0, z = 0;
+    for (const point of points) {
+        const v = angularCoordinatesToSurfaceVector(point);
+        x += v[0];
+        y += v[1];
+        z += v[2];
+    }
+    const length = Math.hypot(x, y, z);
+    if (length < 1e-9) {
+        return undefined;
+    }
+    return new LngLat(Math.atan2(x, z) * 180 / Math.PI, Math.asin(clamp(y / length, -1, 1)) * 180 / Math.PI);
+}
+
+/**
+ * Solves the 3x3 system whose columns are given, by Cramer's rule, or undefined if it is singular.
+ */
+function solve3(columns: Array<[number, number, number]>, b: [number, number, number]): [number, number, number] | undefined {
+    const det = (a: [number, number, number], c: [number, number, number], d: [number, number, number]) =>
+        a[0] * (c[1] * d[2] - c[2] * d[1]) - c[0] * (a[1] * d[2] - a[2] * d[1]) + d[0] * (a[1] * c[2] - a[2] * c[1]);
+    const [c0, c1, c2] = columns;
+    const d = det(c0, c1, c2);
+    if (!Number.isFinite(d) || Math.abs(d) < 1e-12) {
+        return undefined;
+    }
+    return [det(b, c1, c2) / d, det(c0, b, c2) / d, det(c0, c1, b) / d];
+}
+
+/**
+ * Points along the four edges of the bounds, going around them.
+ * @param bounds - The bounds; an east edge past 180 crosses the antimeridian.
+ * @param perEdge - Points per edge, corners included once.
+ */
+function sampleBoundsEdges(bounds: LngLatBounds, perEdge: number): LngLat[] {
+    const west = bounds.getWest();
+    const east = bounds.getEast();
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+    const samples: LngLat[] = [];
+    for (let i = 0; i < perEdge; i++) {
+        const t = i / perEdge;
+        samples.push(
+            new LngLat(lerp(west, east, t), north),
+            new LngLat(east, lerp(north, south, t)),
+            new LngLat(lerp(east, west, t), south),
+            new LngLat(west, lerp(south, north, t)));
+    }
+    return samples;
+}
 
 /**
  * Globe radius relative to the smaller viewport dimension below which zoom movement near the horizon
@@ -238,7 +314,172 @@ export class VerticalPerspectiveCameraHelper implements ICameraHelper {
 
         // Compute target zoom from the obtained scale.
         result.zoom = Math.min(clonedTr.zoom + scaleZoom(smallestNeededScale), options.maxZoom);
-        return result;
+        return VerticalPerspectiveCameraHelper.refineFitOnSphere(result, options, fitPadding, mapPadding, bounds, clonedTr);
+    }
+
+    /**
+     * Refines a fit on the sphere. On a perspective globe neither the projected size of the bounds nor their
+     * position is linear in the zoom, and the projected bounds are not symmetric about their mercator middle,
+     * so one scale step from the mercator answer leaves the bounds off-centre and short of, or past, the padded
+     * viewport. This solves for the center and zoom at which the projected edges are centred in the padded
+     * viewport and fill it, sampling every edge rather than its corners and midpoints, by a damped Newton
+     * iteration on the screen offset of the bounds and the log of the scale still needed.
+     * @param initial - The first estimate; its zoom is the starting zoom and its bearing is kept.
+     * @param options - The fit options: `offset` and `maxZoom` are honoured.
+     * @param fitPadding - The padding of the fit.
+     * @param mapPadding - The map's own padding.
+     * @param bounds - The bounds to fit.
+     * @param tr - A transform with the map's size, padding, bearing and a pitch of 0. It is modified.
+     * @returns The refined camera, or `initial` when no camera shows all of the bounds.
+     */
+    static refineFitOnSphere(initial: CameraForBoxAndBearingHandlerResult, options: CameraForBoundsOptions, fitPadding: PaddingOptions, mapPadding: PaddingOptions, bounds: LngLatBounds, tr: ITransform): CameraForBoxAndBearingHandlerResult {
+        const left = mapPadding.left + fitPadding.left;
+        const top = mapPadding.top + fitPadding.top;
+        const availableWidth = tr.width - left - mapPadding.right - fitPadding.right;
+        const availableHeight = tr.height - top - mapPadding.bottom - fitPadding.bottom;
+        if (availableWidth <= 0 || availableHeight <= 0) {
+            return initial;
+        }
+        const offset = Point.convert(options.offset ?? [0, 0]).rotate(degreesToRadians(-initial.bearing));
+        const target = new Point(left + availableWidth / 2, top + availableHeight / 2).add(offset);
+        const samples = sampleBoundsEdges(bounds, FIT_SAMPLES_PER_EDGE);
+        const minZoom = tr.minZoom;
+        const maxZoom = Math.min(options.maxZoom ?? tr.maxZoom, tr.maxZoom);
+
+        // What is left to do at a camera: [x and y offset of the bounds from where they belong, in pixels;
+        // log2 of the scale they still need], or undefined when part of them is behind the planet.
+        const residual = (center: LngLat, zoom: number): [number, number, number] | undefined => {
+            tr.setCenter(center);
+            tr.setZoom(zoom);
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const sample of samples) {
+                if (tr.isLocationOccluded(sample)) {
+                    return undefined;
+                }
+                const p = tr.locationToScreenPoint(sample);
+                if (p.x < minX) minX = p.x;
+                if (p.y < minY) minY = p.y;
+                if (p.x > maxX) maxX = p.x;
+                if (p.y > maxY) maxY = p.y;
+            }
+            // The scale that brings the side of the bounds farthest from where they belong to its padded edge.
+            // It is the scale that fills the padded viewport once the bounds are centred, and keeps them inside it
+            // when they cannot be, as when the center would have to pass the latitude the zoom allows.
+            const halfWidth = availableWidth / 2;
+            const halfHeight = availableHeight / 2;
+            const scale = Math.min(
+                halfWidth / Math.max(target.x - minX, maxX - target.x),
+                halfHeight / Math.max(target.y - minY, maxY - target.y));
+            let zoomNeeded = scaleZoom(scale);
+            // At a zoom limit, the scale it cannot give is not asked for.
+            if ((zoomNeeded > 0 && zoom >= maxZoom) || (zoomNeeded < 0 && zoom <= minZoom)) {
+                zoomNeeded = 0;
+            }
+            return [target.x - (minX + maxX) / 2, target.y - (minY + maxY) / 2, zoomNeeded];
+        };
+        // In pixels. A sum, so a step that improves the zoom counts while the center cannot move further, and
+        // bounds that reach past the padded viewport weigh ten times as much as bounds short of it.
+        const size = (r: [number, number, number]) => Math.abs(r[0]) + Math.abs(r[1]) +
+            Math.abs(r[2]) * Math.max(availableWidth, availableHeight) * (r[2] < 0 ? FIT_OUTSIDE_WEIGHT : 1);
+        // The camera after moving what is under the center point by (dx, dy) pixels and zooming by dz.
+        const moved = (center: LngLat, zoom: number, dx: number, dy: number, dz: number): [LngLat, number] => {
+            tr.setCenter(center);
+            tr.setZoom(zoom);
+            return [tr.screenPointToLocation(tr.centerPoint.sub(new Point(dx, dy))), clamp(zoom + dz, minZoom, maxZoom)];
+        };
+
+        // How far the bounds reach past the padded viewport, and how far they are from centred and filling it, in
+        // pixels; undefined when part of them is behind the planet.
+        const fitQuality = (center: LngLat, zoom: number): {outside: number; misfit: number} | undefined => {
+            tr.setCenter(center);
+            tr.setZoom(zoom);
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const sample of samples) {
+                if (tr.isLocationOccluded(sample)) {
+                    return undefined;
+                }
+                const p = tr.locationToScreenPoint(sample);
+                if (p.x < minX) minX = p.x;
+                if (p.y < minY) minY = p.y;
+                if (p.x > maxX) maxX = p.x;
+                if (p.y > maxY) maxY = p.y;
+            }
+            const gaps = [minX - left, left + availableWidth - maxX, minY - top, top + availableHeight - maxY];
+            return {
+                outside: Math.max(0, -Math.min(...gaps)),
+                misfit: Math.abs(gaps[0] - gaps[1]) / 2 + Math.abs(gaps[2] - gaps[3]) / 2 + Math.max(0, Math.min(Math.min(gaps[0], gaps[1]), Math.min(gaps[2], gaps[3]))),
+            };
+        };
+
+        // Start from the middle of the bounds on the sphere: the mercator middle lies poleward of it, far so for
+        // bounds reaching high latitudes. Zoom out until all of the bounds are in front of the planet.
+        let center = sphericalMiddle(samples) ?? LngLat.convert(initial.center);
+        let zoom = clamp(initial.zoom, minZoom, maxZoom);
+        let r = residual(center, zoom);
+        while (!r && zoom > minZoom) {
+            zoom = Math.max(minZoom, zoom - 0.5);
+            r = residual(center, zoom);
+        }
+        if (!r) {
+            return initial;
+        }
+
+        for (let i = 0; i < FIT_MAX_ITERATIONS && size(r) > FIT_TOLERANCE_PIXELS; i++) {
+            // The Jacobian by forward differences, one column per unknown.
+            const columns: Array<[number, number, number]> = [];
+            for (const [dx, dy, dz] of [[FIT_DIFFERENCE_PIXELS, 0, 0], [0, FIT_DIFFERENCE_PIXELS, 0], [0, 0, FIT_DIFFERENCE_ZOOM]]) {
+                const [c, z] = moved(center, zoom, dx, dy, dz);
+                const rd = residual(c, z);
+                const h = dx || dy || dz;
+                columns.push(rd ? [(rd[0] - r[0]) / h, (rd[1] - r[1]) / h, (rd[2] - r[2]) / h] : [dx ? -1 : 0, dy ? -1 : 0, dz ? -1 : 0]);
+            }
+            // Keep a step well inside the globe's disc, where a screen point still names a nearby location.
+            const maxStep = FIT_MAX_STEP_GLOBE_RADII * getGlobeRadiusPixels(tr.worldSize, center.lat);
+            const limited = ([dx, dy, dz]: [number, number, number]): [number, number, number] => {
+                const limit = Math.min(1, maxStep / (Math.hypot(dx, dy) || 1), FIT_MAX_STEP_ZOOM / (Math.abs(dz) || 1));
+                return [dx * limit, dy * limit, dz * limit];
+            };
+            // The Newton step first; then the zoom alone and the center alone, for when the center is held by
+            // the latitude the zoom allows and the coupled step cannot improve.
+            const candidates: Array<[number, number, number]> = [
+                solve3(columns, [-r[0], -r[1], -r[2]]) ?? [r[0], r[1], r[2]],
+                [0, 0, r[2]],
+                [r[0], r[1], 0],
+            ];
+            let accepted = false;
+            for (const candidate of candidates) {
+                let step = limited(candidate);
+                // Backtrack until the step improves the fit.
+                for (let k = 0; k < 6 && !accepted; k++) {
+                    const [c, z] = moved(center, zoom, step[0], step[1], step[2]);
+                    const rc = residual(c, z);
+                    if (rc && size(rc) < size(r)) {
+                        center = c;
+                        zoom = z;
+                        r = rc;
+                        accepted = true;
+                    } else {
+                        step = [step[0] / 2, step[1] / 2, step[2] / 2];
+                    }
+                }
+                if (accepted) {
+                    break;
+                }
+            }
+            if (!accepted) {
+                break;
+            }
+        }
+        // Bounds wrapping far around the globe near a pole can lead the steps astray: keep the first estimate
+        // unless the refined camera is better, containment first.
+        const refined = fitQuality(center, zoom);
+        const first = fitQuality(LngLat.convert(initial.center), initial.zoom);
+        const better = refined && (!first || refined.outside < first.outside - FIT_TOLERANCE_PIXELS ||
+            (Math.abs(refined.outside - first.outside) <= FIT_TOLERANCE_PIXELS && refined.misfit < first.misfit));
+        if (!better) {
+            return initial;
+        }
+        return {center: center.wrap(), zoom, bearing: initial.bearing};
     }
 
     /**

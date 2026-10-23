@@ -21,6 +21,7 @@ export class GlobeProjection extends Evented implements Projection {
     _transitioning: Transitioning<ProjectionProps>;
     _mercatorProjection: MercatorProjection;
     _verticalPerspectiveProjection: VerticalPerspectiveProjection;
+    _lastEvaluationParameters: EvaluationParameters;
 
     constructor(projection: ProjectionSpecification | undefined, globalState: Record<string, any>) {
         super();
@@ -33,25 +34,18 @@ export class GlobeProjection extends Evented implements Projection {
     }
 
     public get transitionState(): number {
-        const currentProjectionSpecValue = this.properties.get('type');
-        if (typeof currentProjectionSpecValue === 'string' && currentProjectionSpecValue === 'mercator') {
-            return 0;
-        }
-        if (typeof currentProjectionSpecValue === 'string' && currentProjectionSpecValue === 'vertical-perspective') {
-            return 1;
-        }
-        if (currentProjectionSpecValue instanceof ProjectionDefinition) {
-            if (currentProjectionSpecValue.from === currentProjectionSpecValue.to) {
-                return currentProjectionSpecValue.from === 'mercator' ? 0 : 1;
-            }
-            if (currentProjectionSpecValue.from === 'vertical-perspective' && currentProjectionSpecValue.to === 'mercator') {
-                return 1 - currentProjectionSpecValue.transition;
-            }
-            if (currentProjectionSpecValue.from === 'mercator' && currentProjectionSpecValue.to === 'vertical-perspective') {
-                return currentProjectionSpecValue.transition;
-            }
-        };
-        return 1;
+        return transitionStateOf(this.properties.get('type'));
+    }
+
+    /**
+     * The transition state the projection would have at another zoom, with the rest of the last evaluation unchanged.
+     * A camera computed for a target zoom, such as a fit, is solved in the projection of that zoom.
+     * @param zoom - The zoom to evaluate the projection at.
+     * @returns 0 for mercator, 1 for vertical perspective, and the blend in between.
+     */
+    public transitionStateAtZoom(zoom: number): number {
+        const properties = this._transitioning.possiblyEvaluate(new EvaluationParameters(zoom, this._lastEvaluationParameters));
+        return transitionStateOf(properties.get('type'));
     }
 
     get useGlobeRendering(): boolean {
@@ -120,6 +114,28 @@ export class GlobeProjection extends Evented implements Projection {
     }
 
     recalculate(parameters: EvaluationParameters): void {
+        this._lastEvaluationParameters = parameters;
         this.properties = this._transitioning.possiblyEvaluate(parameters);
     }
+}
+
+function transitionStateOf(currentProjectionSpecValue: ProjectionPropsPossiblyEvaluated['type']): number {
+    if (typeof currentProjectionSpecValue === 'string' && currentProjectionSpecValue === 'mercator') {
+        return 0;
+    }
+    if (typeof currentProjectionSpecValue === 'string' && currentProjectionSpecValue === 'vertical-perspective') {
+        return 1;
+    }
+    if (currentProjectionSpecValue instanceof ProjectionDefinition) {
+        if (currentProjectionSpecValue.from === currentProjectionSpecValue.to) {
+            return currentProjectionSpecValue.from === 'mercator' ? 0 : 1;
+        }
+        if (currentProjectionSpecValue.from === 'vertical-perspective' && currentProjectionSpecValue.to === 'mercator') {
+            return 1 - currentProjectionSpecValue.transition;
+        }
+        if (currentProjectionSpecValue.from === 'mercator' && currentProjectionSpecValue.to === 'vertical-perspective') {
+            return currentProjectionSpecValue.transition;
+        }
+    }
+    return 1;
 }
