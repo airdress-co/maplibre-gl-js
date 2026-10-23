@@ -136,7 +136,7 @@ test('doc-numbers refuses a document number in an added line and Airdress in an 
     writeFileSync(p, clean.replace('+new\n', '+new // see SPEC-170\n'));
     let r = run(dn, []);
     assert.equal(r.status, 1);
-    assert.match(r.out, /document number in an added line/);
+    assert.match(r.out, /0002-add-b\.patch: document number: added line/);
     writeFileSync(p, clean.replace('+new\n', '+new // for airdress\n'));
     r = run(dn, []);
     assert.equal(r.status, 1);

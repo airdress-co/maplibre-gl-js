@@ -28,3 +28,15 @@ feature = "infrastructure"
 summary = "A copyright line for the fork's changes above upstream's notices; the banner links the fork's licence"
 offer = "never"
 drop_when = "never"
+
+[[patch]]
+file = "0003-globe-fit.patch"
+topic = "globe-fit"
+feature = "fit"
+summary = "fitBounds and cameraForBounds on the globe: solved in the projection of the fitted zoom, centred and filling the padded viewport, from any start; the constructor's bounds fitted again once the projection is known"
+entry = "fitBounds / cameraForBounds / jumpTo, easeTo and flyTo across the globe-to-mercator transition (unflagged bug fix)"
+issue = "maplibre/maplibre-gl-js#5439"
+offer = "undecided"
+pr = ""
+drop_when = "upstream ships an equivalent fix: these tests pass on plain upstream"
+tests = ["unit:src/ui/map_tests/map_fit_bounds_globe.test.ts", "unit:src/ui/camera.test.ts", "render:projection/globe/fit-bounds-country-portrait", "render:projection/globe/fit-bounds-country-landscape"]

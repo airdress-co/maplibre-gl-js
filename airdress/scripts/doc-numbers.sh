@@ -24,6 +24,11 @@ never_offered() {
         END { exit found ? 0 : 1 }' "$PATCH_DIR/series.toml"
 }
 
+# report NAME ADDED PATTERN WHAT: the added lines matching PATTERN, numbered among the added lines.
+report() {
+    printf '%s\n' "$2" | grep -inE "$3" | sed "s|^|doc-numbers: $1: $4: added line |" >&2
+}
+
 branch="${1:-}"
 if [ -n "$branch" ] && echo "$branch" | grep -qiE "$doc_number"; then
     echo "doc-numbers: branch name '$branch' carries a document number" >&2
@@ -38,16 +43,14 @@ for f in "$PATCH_DIR"/*.patch; do
         status=1
     fi
     # Added lines only: '+' inside a hunk, never the '+++' header.
-    added="$(awk '/^diff --git /{h=0} /^@@/{h=1; next} h && /^\+/ {print FILENAME ":" FNR ": " substr($0, 2)}' "$f")"
-    if hits="$(printf '%s\n' "$added" | grep -iE "$doc_number")"; then
-        printf '%s\n' "$hits" | sed 's/^/doc-numbers: document number in an added line: /' >&2
+    added="$(awk '/^diff --git /{h=0} /^@@/{h=1; next} h && /^\+/ {print substr($0, 2)}' "$f")"
+    if printf '%s\n' "$added" | grep -qiE "$doc_number"; then
+        report "$name" "$added" "$doc_number" "document number"
         status=1
     fi
-    if ! never_offered "$name"; then
-        if hits="$(printf '%s\n' "$added" | grep -iE 'airdress')"; then
-            printf '%s\n' "$hits" | sed 's/^/doc-numbers: an offerable patch names Airdress: /' >&2
-            status=1
-        fi
+    if ! never_offered "$name" && printf '%s\n' "$added" | grep -qi 'airdress'; then
+        report "$name" "$added" 'airdress' "an offerable patch names Airdress"
+        status=1
     fi
 done
 
