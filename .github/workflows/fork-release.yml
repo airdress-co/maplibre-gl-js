@@ -91,9 +91,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
         with:
           node-version-file: .nvmrc
-      # No install scripts: the build needs none (canvas, puppeteer and the
-      # rest serve the test suites), and the output is byte for byte the same.
+      # No install scripts: canvas, puppeteer and the rest serve the test
+      # suites, not the build. That also skips upstream's `prepare`, which is
+      # `npm run codegen` (the generated *.g.ts sources the build imports), so
+      # it runs here explicitly. v6.15.0-airdress.1 was tagged without it and
+      # never built.
       - run: npm ci --ignore-scripts
+      - run: npm run codegen
       - run: npm run build-dist
       - name: Pack
         env:
