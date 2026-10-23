@@ -1,0 +1,94 @@
+# Daily: re-apply the series onto upstream's newest release and open a pull
+# request to main as airdress-bot with the refreshed patches, the range-diff,
+# the divergence, the dropped patches, upstream's changelog and any security
+# advisory. A conflict opens a draft naming the patch that stopped, with the
+# partly applied tree on work/<tag>. Nothing is force-pushed, ever.
+name: fork-reapply
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      to:
+        description: "Re-apply onto this upstream tag instead of the newest release"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-reapply
+  cancel-in-progress: false
+
+jobs:
+  reapply:
+    name: re-apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version: 26
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: bot
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+      - name: Upstream's published advisories
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api repos/maplibre/maplibre-gl-js/security-advisories > advisories.json || echo '[]' > advisories.json
+      - name: Re-apply
+        id: reapply
+        env:
+          TO: ${{ inputs.to }}
+        run: |
+          set +e
+          args=(--repo work --advisories advisories.json --report body.md --github-output "$GITHUB_OUTPUT")
+          [ -z "$TO" ] || args+=(--to "$TO")
+          airdress/scripts/reapply.sh "${args[@]}"
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || [ "$status" -eq 3 ]
+      - name: Open the pull request
+        if: steps.reapply.outputs.tag != ''
+        env:
+          TAG: ${{ steps.reapply.outputs.tag }}
+          CONFLICT: ${{ steps.reapply.outputs.conflict }}
+          STOPPED: ${{ steps.reapply.outputs.stopped }}
+          URGENT: ${{ steps.reapply.outputs.urgent }}
+          TOKEN: ${{ steps.bot.outputs.token }}
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          branch="reapply/$TAG"
+          remote="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          if [ -n "$(git ls-remote "$remote" "refs/heads/$branch")" ]; then
+            echo "$branch exists: its pull request is still open or was not cleaned up"
+            exit 0
+          fi
+          git config user.name "airdress-bot[bot]"
+          git config user.email "airdress-bot[bot]@users.noreply.github.com"
+          git checkout -q -b "$branch"
+          title="Re-apply the series onto $TAG"
+          [ "$URGENT" != true ] || title="security: $title"
+          draft=()
+          if [ "$CONFLICT" = true ]; then
+            git -C work push -q "$remote" "work/$TAG"
+            draft=(--draft)
+            title="$title ($STOPPED conflicts)"
+            git commit -q --allow-empty -m "$title" -m "The partly applied tree is on work/$TAG."
+          else
+            git add patches
+            git commit -q -m "$title"
+          fi
+          git push -q "$remote" "$branch"
+          # A pull request body holds at most 65,536 characters.
+          if [ "$(wc -c < body.md)" -gt 60000 ]; then
+            head -c 60000 body.md > body.cut && printf '\n\n(cut: the full report is in this run'"'"'s log)\n' >> body.cut && cat body.md && mv body.cut body.md
+          fi
+          gh pr create --repo "$REPO" --base main --head "$branch" --title "$title" --body-file body.md "${draft[@]}"

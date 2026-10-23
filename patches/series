@@ -1,0 +1,5 @@
+# The upstream tag the series applies to, then the patches in order.
+# Maintained by airdress/scripts/refresh.sh; see airdress/README.md.
+base v6.15.0
+0001-fork-ci.patch
+0002-packaging.patch

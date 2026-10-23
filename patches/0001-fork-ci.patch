@@ -1,0 +1,479 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Robert Jefe Lindstaedt <robert.lindstaedt@gmail.com>
+Date: Fri, 23 Oct 2026 16:18:38 +0200
+Subject: [PATCH] Remove upstream's workflows and dependabot configuration
+
+This tree is built by the fork's own workflows from its main branch.
+Upstream's release workflow publishes to npm on every push to main, and its
+test and dependabot workflows would run on every branch pushed here, so none
+of them may exist in a tree this fork pushes.
+---
+ .github/dependabot.yml                       |  46 ----
+ .github/workflows/auto-merge-dependabot.yml  |  26 ---
+ .github/workflows/codeql-analysis.yml        |  72 ------
+ .github/workflows/create-bumb-version-pr.yml |  22 --
+ .github/workflows/release.yml                |  19 --
+ .github/workflows/test-all.yml               | 234 -------------------
+ 6 files changed, 419 deletions(-)
+ delete mode 100644 .github/dependabot.yml
+ delete mode 100644 .github/workflows/auto-merge-dependabot.yml
+ delete mode 100644 .github/workflows/codeql-analysis.yml
+ delete mode 100644 .github/workflows/create-bumb-version-pr.yml
+ delete mode 100644 .github/workflows/release.yml
+ delete mode 100644 .github/workflows/test-all.yml
+
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+deleted file mode 100644
+index 7181a4f3524f2d0d87635863547b7bb595786f10..0000000000000000000000000000000000000000
+--- a/.github/dependabot.yml
++++ /dev/null
+@@ -1,46 +0,0 @@
+-version: 2
+-updates:
+-  - package-ecosystem: "npm"
+-    directory: "/"
+-    schedule:
+-      interval: "daily"
+-    open-pull-requests-limit: 20
+-    versioning-strategy: increase
+-    groups:
+-      vitest:
+-        patterns:
+-          - "*vitest*"
+-      eslint:
+-        patterns:
+-          - "*eslint*"
+-    cooldown:
+-      default-days: 5
+-      semver-major-days: 5
+-      semver-minor-days: 3
+-      semver-patch-days: 3
+-      include:
+-        - "*"
+-      exclude:
+-        - "@maplibre/*"
+-  - package-ecosystem: "github-actions"
+-    directory: "/"
+-    schedule:
+-      interval: "daily"
+-    groups:
+-      codeql-action:
+-        patterns:
+-          - "github/codeql-action*"
+-    cooldown:
+-      default-days: 3
+-      # no semver support for github-actions
+-      # => no specific configuration for this
+-      include:
+-        - "*"
+-  - package-ecosystem: "docker-compose"
+-    directory: "/"
+-    schedule:
+-      interval: "daily"
+-    ignore:
+-      # Odd-numbered Node.js majors are never promoted to LTS
+-      - dependency-name: "node"
+-        versions: ["27.x", "29.x", "31.x", "33.x", "35.x", "37.x", "39.x"]
+diff --git a/.github/workflows/auto-merge-dependabot.yml b/.github/workflows/auto-merge-dependabot.yml
+deleted file mode 100644
+index 1d81378ee053a00493422f62d8d24c94e8bcd9ff..0000000000000000000000000000000000000000
+--- a/.github/workflows/auto-merge-dependabot.yml
++++ /dev/null
+@@ -1,26 +0,0 @@
+-name: Automerge Dependabot
+-
+-on: pull_request
+-
+-permissions: write-all
+-
+-jobs:
+-  dependabot:
+-    runs-on: ubuntu-latest
+-    if: ${{ github.actor == 'dependabot[bot]' }}
+-    steps:
+-      - name: Dependabot metadata
+-        id: metadata
+-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+-        with:
+-          github-token: "${{ secrets.GITHUB_TOKEN }}"
+-      - name: Approve Dependabot PRs
+-        run: gh pr review --approve "$PR_URL"
+-        env:
+-          PR_URL: ${{github.event.pull_request.html_url}}
+-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+-      - name: Enable auto-merge for Dependabot PRs
+-        run: gh pr merge --auto --squash "$PR_URL"
+-        env:
+-          PR_URL: ${{github.event.pull_request.html_url}}
+-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+diff --git a/.github/workflows/codeql-analysis.yml b/.github/workflows/codeql-analysis.yml
+deleted file mode 100644
+index 42e709e089c47074e678b1a887a0b1532c107cdf..0000000000000000000000000000000000000000
+--- a/.github/workflows/codeql-analysis.yml
++++ /dev/null
+@@ -1,72 +0,0 @@
+-# For most projects, this workflow file will not need changing; you simply need
+-# to commit it to your repository.
+-#
+-# You may wish to alter this file to override the set of languages analyzed,
+-# or to provide custom queries or build logic.
+-#
+-# ******** NOTE ********
+-# We have attempted to detect the languages in your repository. Please check
+-# the `language` matrix defined below to confirm you have the correct set of
+-# supported CodeQL languages.
+-#
+-name: "CodeQL"
+-
+-on:
+-  push:
+-    branches: [ main ]
+-  pull_request:
+-    # The branches below must be a subset of the branches above
+-    branches: [ main ]
+-  schedule:
+-    - cron: '17 0 * * 6'
+-
+-jobs:
+-  analyze:
+-    name: Analyze
+-    runs-on: ubuntu-latest
+-    permissions:
+-      actions: read
+-      contents: read
+-      security-events: write
+-
+-    strategy:
+-      fail-fast: false
+-      matrix:
+-        language: [ 'javascript' ]
+-        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python', 'ruby' ]
+-        # Learn more about CodeQL language support at https://git.io/codeql-language-support
+-
+-    steps:
+-    - name: Checkout repository
+-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-      with:
+-        persist-credentials: false
+-
+-    # Initializes the CodeQL tools for scanning.
+-    - name: Initialize CodeQL
+-      uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+-      with:
+-        languages: ${{ matrix.language }}
+-        # If you wish to specify custom queries, you can do so here or in a config file.
+-        # By default, queries listed here will override any specified in a config file.
+-        # Prefix the list here with "+" to use these queries and those in the config file.
+-        # queries: ./path/to/local/query, your-org/your-repo/queries@main
+-
+-    # Autobuild attempts to build any compiled languages  (C/C++, C#, or Java).
+-    # If this step fails, then you should remove it and run the build manually (see below)
+-    - name: Autobuild
+-      uses: github/codeql-action/autobuild@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+-
+-    # ℹ️ Command-line programs to run using the OS shell.
+-    # 📚 https://git.io/JvXDl
+-
+-    # ✏️ If the Autobuild fails above, remove it and uncomment the following three lines
+-    #    and modify them (or add more) to build your code if your project
+-    #    uses a compiled language
+-
+-    #- run: |
+-    #   make bootstrap
+-    #   make release
+-
+-    - name: Perform CodeQL Analysis
+-      uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+diff --git a/.github/workflows/create-bumb-version-pr.yml b/.github/workflows/create-bumb-version-pr.yml
+deleted file mode 100644
+index 18f770accb74cff6bab3ad4c70565d5b494dbff2..0000000000000000000000000000000000000000
+--- a/.github/workflows/create-bumb-version-pr.yml
++++ /dev/null
+@@ -1,22 +0,0 @@
+-name: Create bump version PR
+-
+-on:
+-  workflow_dispatch:
+-    inputs:
+-      release_type:
+-        type: choice
+-        description: 'Type of version bump'
+-        options:
+-          - major
+-          - minor
+-          - patch
+-          - premajor
+-          - preminor
+-          - prepatch
+-          - prerelease
+-
+-jobs:
+-  bump-version-pr:
+-    uses: maplibre/reusable-workflows/.github/workflows/create-bump-version-pr.yml@main
+-    with:
+-      version: ${{ github.event.inputs.release_type }}
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+deleted file mode 100644
+index 439c5f630455109abd0da8665049c7b240fd1022..0000000000000000000000000000000000000000
+--- a/.github/workflows/release.yml
++++ /dev/null
+@@ -1,19 +0,0 @@
+-name: Release
+-
+-permissions:
+-  id-token: write  # Required for trusted publishing
+-  contents: write
+-  attestations: write
+-
+-on:
+-  push:
+-    branches: [main]
+-  workflow_dispatch:
+-
+-jobs:
+-  release:
+-    uses: maplibre/reusable-workflows/.github/workflows/npm-publish.yml@main
+-    with:
+-      build-command: npm ci && npm run build-dist
+-      docs-output-dir: site
+-      docs-gh-pages-dir: docs
+diff --git a/.github/workflows/test-all.yml b/.github/workflows/test-all.yml
+deleted file mode 100644
+index 1de01e280da7c7d2e614237cab0063c84c378c0d..0000000000000000000000000000000000000000
+--- a/.github/workflows/test-all.yml
++++ /dev/null
+@@ -1,234 +0,0 @@
+-name: Tests
+-
+-on:
+-  push:
+-    branches: [main]
+-  pull_request:
+-  workflow_dispatch:
+-
+-permissions:
+-  checks: write
+-  pull-requests: write
+-  contents: write
+-
+-jobs:
+-  code-hygiene:
+-    name: Code Hygiene
+-    runs-on: ubuntu-latest
+-    steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-        with:
+-          persist-credentials: false
+-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+-        with:
+-          node-version-file: '.nvmrc'
+-      - run: npm ci
+-      - run: npm run lint -- --max-warnings 0
+-        if: '!cancelled()'
+-      - run: npm run lint-css
+-        if: '!cancelled()'
+-      - run: npm run generate-typings
+-        if: '!cancelled()'
+-      - run: npm run typecheck
+-        if: '!cancelled()'
+-      - run: npm run generate-docs
+-      - name: Build docs
+-        run: npm run docs
+-      - name: Check spelling
+-        # This need to run after the docs are built
+-        run: npm run spellcheck
+-
+-  unit-tests:
+-    name: Unit tests
+-    runs-on: ubuntu-latest
+-    timeout-minutes: 40
+-    steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-        with:
+-          persist-credentials: false
+-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+-        with:
+-          node-version-file: '.nvmrc'
+-      - name: Start display server
+-        run: nohup Xvfb &
+-          echo "DISPLAY=:0" >> $GITHUB_ENV
+-      - run: npm ci
+-      - run: npm run test-unit-ci
+-      - name: Upload coverage artifact
+-        if: '!cancelled()'
+-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+-        with:
+-          name: coverage-reports-unit-tests
+-          path: ${{ github.workspace }}/coverage/vitest/unit/coverage-final.json
+-          retention-days: 1
+-
+-  integration-tests:
+-    name: Integration tests
+-    strategy:
+-      matrix:
+-        os: [ubuntu-latest, windows-latest]
+-      fail-fast: false
+-    runs-on: ${{ matrix.os }}
+-    timeout-minutes: 40
+-    steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-        with:
+-          persist-credentials: false
+-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+-        with:
+-          node-version-file: '.nvmrc'
+-      - name: Disable AppArmor
+-        if: runner.os == 'Linux'
+-        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+-      - run: npm ci
+-      - run: npm run build-dist
+-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+-        if: '!cancelled()'
+-        with:
+-          name: build-dist-${{ matrix.os }}
+-          path: dist/
+-      - run: npm run test-integration-ci
+-      - name: Move files
+-        if: runner.os == 'Linux'
+-        run: |
+-          mkdir -p ${{ github.workspace }}/upload
+-          mv ${{ github.workspace }}/coverage/vitest/integration/coverage-final.json ${{ github.workspace }}/upload/coverage-final-integration.json
+-          mv ${{ github.workspace }}/coverage/query/coverage-final.json ${{ github.workspace }}/upload/coverage-final-query.json
+-      - name: Upload coverage artifact
+-        if: ${{ !cancelled() && runner.os == 'Linux' }}
+-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+-        with:
+-          name: coverage-reports-integration-tests
+-          path: |
+-            ${{ github.workspace }}/upload/coverage-final-integration.json
+-            ${{ github.workspace }}/upload/coverage-final-query.json
+-          retention-days: 1
+-
+-  render-tests:
+-    name: Render tests
+-    env:
+-      SPLIT_COUNT: 6
+-    strategy:
+-      fail-fast: false
+-      matrix:
+-        os: [ubuntu-latest, windows-latest]
+-        split: [0, 1, 2, 3, 4, 5]
+-    runs-on: ${{ matrix.os }}
+-    timeout-minutes: 120
+-    steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-        with:
+-          persist-credentials: false
+-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+-        with:
+-          node-version-file: '.nvmrc'
+-      - name: install fonts for the render tests that draw text locally
+-        if: runner.os == 'Linux'
+-        run: sudo apt install fonts-noto-cjk fonts-noto-core
+-      - name: Disable AppArmor
+-        if: runner.os == 'Linux'
+-        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+-      - run: npm ci
+-      - name: Start display server
+-        if: runner.os == 'Linux'
+-        run: nohup Xvfb &
+-          echo "DISPLAY=:0" >> $GITHUB_ENV
+-      - run: npm run build-dist
+-      - name: Run Render tests
+-        run: npm run test-render
+-        env:
+-          CURRENT_SPLIT_INDEX: ${{ matrix.split }}
+-      - name: Move files
+-        if: runner.os == 'Linux'
+-        run: |
+-          mkdir -p ${{ github.workspace }}/upload
+-          mv ${{ github.workspace }}/coverage/render/coverage-final.json ${{ github.workspace }}/upload/coverage-final-render-${{ matrix.split }}.json
+-      - name: Upload coverage artifact
+-        if: ${{ !cancelled() && runner.os == 'Linux' }}
+-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+-        with:
+-          name: coverage-reports-render-tests-${{ matrix.split }}
+-          path: ${{ github.workspace }}/upload/coverage-final-render-${{ matrix.split }}.json
+-          retention-days: 1
+-      - name: Upload render test failure
+-        if: failure()
+-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+-        with:
+-          name: render-test-report-${{ matrix.os }}-${{ matrix.split }}
+-          path: ${{ github.workspace }}/test/integration/render/results.html
+-
+-  build-tests:
+-    name: Build tests
+-    strategy:
+-      matrix:
+-        os: [ubuntu-latest, windows-latest]
+-    runs-on: ${{ matrix.os }}
+-    steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-        with:
+-          persist-credentials: false
+-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+-        with:
+-          node-version-file: '.nvmrc'
+-      - run: npm ci
+-      - run: npm run build-dist
+-      - run: npm run test-build-ci
+-
+-  benchmarks:
+-    name: Benchmarks
+-    runs-on: ubuntu-latest
+-    timeout-minutes: 20
+-    steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-        with:
+-          persist-credentials: false
+-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+-        with:
+-          node-version-file: '.nvmrc'
+-      - run: npm ci
+-      - run: npm run bench
+-
+-  merge-and-report:
+-    name: Merge coverage and report
+-    runs-on: ubuntu-latest
+-    needs: [unit-tests, integration-tests, render-tests]
+-    steps:
+-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+-        with:
+-          persist-credentials: false
+-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+-        with:
+-          node-version-file: '.nvmrc'
+-
+-      - name: Download coverage reports
+-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+-        with:
+-          pattern: coverage-reports-*
+-          merge-multiple: true
+-          path: downloaded
+-
+-      - name: Merge Coverage reports
+-        shell: bash
+-        run: npx nyc report -t ${{ github.workspace }}/downloaded --reporter lcov --reporter json --report-dir coverage-merged
+-
+-      - name: Upload merged coverage report
+-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+-        with:
+-          name: merged-coverage-report
+-          path: coverage-merged
+-
+-      - name: Code Coverage Annotation
+-        if: github.event.pull_request.head.repo.full_name == github.repository
+-        uses: ggilder/codecoverage@3ae5dbe5d9ec0c038f4863cb42d902c4a5f25ae8
+-        with:
+-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+-          COVERAGE_FILE_PATH: "./coverage-merged/lcov.info"
+-          COVERAGE_FORMAT: "lcov"
+-
+-      - name: Upload coverage reports to Codecov
+-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+-        with:
+-          files: ${{ github.workspace }}/coverage-merged/coverage-final.json
+-          verbose: true
+-          token: ${{ secrets.CODECOV_TOKEN }}
+-          disable_search: true

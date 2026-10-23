@@ -1,0 +1,176 @@
+# A fork release, v<upstream>-airdress.<n>: apply the series to its base, push
+# the applied branch and tag once (both refused if they exist), build and pack,
+# rebuild on a fresh runner and compare byte for byte, attest, publish a GitHub
+# Release. Never publishes to npm.
+name: fork-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      number:
+        description: "n in v<base>-airdress.<n>"
+        required: true
+        default: "1"
+  push:
+    tags: ["series-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: apply and push the applied tree
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/series-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The version
+        id: version
+        env:
+          REF: ${{ github.ref }}
+          NUMBER: ${{ inputs.number }}
+        run: |
+          base="$(awk '$1 == "base" {print $2}' patches/series)"
+          case "$REF" in
+            refs/tags/series-v*)
+              version="${REF#refs/tags/series-v}"
+              [ "${version%-airdress.*}" = "${base#v}" ] || { echo "series tag $REF does not name the series' base $base" >&2; exit 1; } ;;
+            *)
+              [[ "$NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "number must be a positive integer" >&2; exit 1; }
+              version="${base#v}-airdress.$NUMBER" ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release v$version from $base"
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: bot
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+      - name: Apply, and push the branch and tag once
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TOKEN: ${{ steps.bot.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          remote="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          if [ -n "$(git ls-remote "$remote" "refs/heads/airdress/v$VERSION" "refs/tags/v$VERSION")" ]; then
+            echo "v$VERSION exists: an applied branch and its tag are pushed once and never moved" >&2
+            exit 1
+          fi
+          airdress/scripts/apply.sh --repo applied --branch "airdress/v$VERSION" --version "$VERSION"
+          git -C applied tag "v$VERSION"
+          git -C applied push -q "$remote" "airdress/v$VERSION" "refs/tags/v$VERSION"
+
+  build:
+    name: build (${{ matrix.run }})
+    needs: apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        # Two runners build the same tag independently; publish compares them.
+        run: [first, second]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v${{ needs.apply.outputs.version }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version-file: .nvmrc
+      # No install scripts: the build needs none (canvas, puppeteer and the
+      # rest serve the test suites), and the output is byte for byte the same.
+      - run: npm ci --ignore-scripts
+      - run: npm run build-dist
+      - name: Pack
+        env:
+          VERSION: ${{ needs.apply.outputs.version }}
+        run: |
+          mkdir out
+          npm pack --ignore-scripts --pack-destination out
+          (cd dist && sha256sum maplibre-gl.mjs maplibre-gl-shared.mjs maplibre-gl-worker.mjs maplibre-gl.css) > out/served.sha256
+          (cd out && sha256sum "maplibre-gl-$VERSION.tgz") > out/tarball.sha256
+          cat out/tarball.sha256 out/served.sha256
+      - name: Attest the tarball
+        if: matrix.run == 'first'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/maplibre-gl-${{ needs.apply.outputs.version }}.tgz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.run }}
+          path: out/
+
+  publish:
+    name: compare and publish
+    needs: [apply, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: build-*
+          path: builds
+      - name: The two builds are byte for byte the same
+        run: |
+          diff builds/build-first/served.sha256 builds/build-second/served.sha256
+          diff builds/build-first/tarball.sha256 builds/build-second/tarball.sha256
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.apply.outputs.version }}
+        run: |
+          base="$(awk '$1 == "base" {print $2}' patches/series)"
+          mkdir npm && curl -fsSL "https://registry.npmjs.org/maplibre-gl/-/maplibre-gl-${base#v}.tgz" | tar xz -C npm
+          mkdir ours && tar xzf "builds/build-first/maplibre-gl-$VERSION.tgz" -C ours
+          {
+            echo "MapLibre GL JS ${base} with the fork's patch series, built from the applied branch \`airdress/v$VERSION\`."
+            echo "Not published to npm. Install from this release's tarball, checked against SHA256SUMS."
+            echo
+            node airdress/scripts/series-check.mjs 2>/dev/null
+            echo
+            echo "### Patches"
+            echo
+            echo '| Patch | Feature | Offered upstream |'
+            echo '|---|---|---|'
+            node -e '
+              const t = require("fs").readFileSync("patches/series.toml", "utf8");
+              for (const b of t.split(/^\[\[patch\]\]$/m).slice(1)) {
+                const g = (k) => b.match(new RegExp(`^${k} = "([^"]*)"`, "m"))?.[1] ?? "";
+                console.log(`| ${g("file")} | ${g("feature")} | ${g("offer")} |`);
+              }'
+            echo
+            echo "### The served files against npm's maplibre-gl@${base#v}"
+            echo
+            echo '```'
+            for f in maplibre-gl.mjs maplibre-gl-shared.mjs maplibre-gl-worker.mjs maplibre-gl.css; do
+              if cmp -s "npm/package/dist/$f" "ours/package/dist/$f"; then echo "$f: identical"
+              else echo "$f: $(diff <(tr ';' '\n' < "npm/package/dist/$f") <(tr ';' '\n' < "ours/package/dist/$f") | grep -c '^[<>]') changed statements"; fi
+            done
+            echo '```'
+          } > notes.md
+          cat builds/build-first/tarball.sha256 builds/build-first/served.sha256 > SHA256SUMS
+      - name: Publish the GitHub Release
+        env:
+          VERSION: ${{ needs.apply.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes-file notes.md \
+            "builds/build-first/maplibre-gl-$VERSION.tgz" SHA256SUMS

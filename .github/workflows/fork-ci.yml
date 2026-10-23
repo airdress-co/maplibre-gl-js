@@ -1,0 +1,242 @@
+# The fork's CI. main holds the patch series, not upstream's tree, so every
+# job first applies the series to its base tag and runs upstream's own suites
+# in the applied tree, on Linux only (Windows is upstream's matrix).
+name: fork-ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APPLIED: applied
+
+jobs:
+  series:
+    name: series
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version: 26
+      - name: Tooling tests
+        run: node --test airdress/test/
+      - name: Files, series and entries agree; the series applies
+        run: node airdress/scripts/series-check.mjs --apply --repo "$APPLIED" --budget-out divergence.md
+      - name: No document numbers in the patches
+        env:
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+        run: airdress/scripts/doc-numbers.sh "$HEAD_REF"
+      - name: Divergence
+        run: cat divergence.md >> "$GITHUB_STEP_SUMMARY"
+
+  hygiene:
+    name: hygiene
+    needs: series
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the series
+        run: airdress/scripts/apply.sh --repo "$APPLIED"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version-file: applied/.nvmrc
+      - name: npm ci
+        working-directory: applied
+        run: npm ci
+      - name: Lint, typings, typecheck
+        working-directory: applied
+        run: |
+          npm run lint -- --max-warnings 0
+          npm run lint-css
+          npm run generate-typings
+          npm run typecheck
+
+  unit:
+    name: unit
+    needs: series
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the series
+        run: airdress/scripts/apply.sh --repo "$APPLIED"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version-file: applied/.nvmrc
+      - name: Start display server
+        run: |
+          nohup Xvfb &
+          echo "DISPLAY=:0" >> "$GITHUB_ENV"
+      - working-directory: applied
+        run: npm ci
+      - working-directory: applied
+        run: npm run test-unit
+
+  integration:
+    name: integration
+    needs: series
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the series
+        run: airdress/scripts/apply.sh --repo "$APPLIED"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version-file: applied/.nvmrc
+      - name: Disable AppArmor
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+      - working-directory: applied
+        run: npm ci
+      - working-directory: applied
+        run: npm run build-dist
+      - working-directory: applied
+        run: npm run test-integration
+
+  render:
+    name: render (${{ matrix.split }})
+    needs: series
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SPLIT_COUNT: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        split: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the series
+        run: airdress/scripts/apply.sh --repo "$APPLIED"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version-file: applied/.nvmrc
+      - name: Fonts the text render tests draw
+        run: sudo apt-get install -y fonts-noto-cjk fonts-noto-core
+      - name: Disable AppArmor
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+      - name: Start display server
+        run: |
+          nohup Xvfb &
+          echo "DISPLAY=:0" >> "$GITHUB_ENV"
+      - working-directory: applied
+        run: npm ci
+      - working-directory: applied
+        run: npm run build-dist
+      - name: Render tests
+        working-directory: applied
+        env:
+          CURRENT_SPLIT_INDEX: ${{ matrix.split }}
+        run: npm run test-render
+      - name: Upload the render report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: render-report-${{ matrix.split }}
+          path: applied/test/integration/render/results.html
+
+  build:
+    name: build
+    needs: series
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the series
+        run: airdress/scripts/apply.sh --repo "$APPLIED"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version-file: applied/.nvmrc
+      - working-directory: applied
+        run: npm ci
+      - working-directory: applied
+        run: npm run build-dist
+      - working-directory: applied
+        run: npm run test-build
+
+  features:
+    name: features
+    needs: series
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the series
+        run: airdress/scripts/apply.sh --repo "$APPLIED"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version-file: applied/.nvmrc
+      - name: Disable AppArmor
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+      - name: Start display server
+        run: |
+          nohup Xvfb &
+          echo "DISPLAY=:0" >> "$GITHUB_ENV"
+      - working-directory: applied
+        run: npm ci && npm run build-dist
+      - name: Each patch's own tests, by name
+        run: airdress/scripts/feature-tests.sh --tree "$APPLIED"
+
+  # Our feature tests against plain upstream at the base. Expected to fail; a
+  # pass means upstream may now do what a patch does (drop it, or record why
+  # ours stays, in series.toml).
+  upstream-equivalence:
+    name: upstream-equivalence
+    needs: series
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Apply the series, and check out plain upstream beside it
+        run: |
+          airdress/scripts/apply.sh --repo "$APPLIED"
+          base="$(awk '$1 == "base" {print $2}' patches/series)"
+          git -C "$APPLIED" worktree add -q --detach ../plain "refs/tags/$base"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v4
+        with:
+          node-version-file: applied/.nvmrc
+      - name: Disable AppArmor
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+      - name: Start display server
+        run: |
+          nohup Xvfb &
+          echo "DISPLAY=:0" >> "$GITHUB_ENV"
+      - working-directory: plain
+        run: npm ci && npm run build-dist
+      - name: Feature tests on plain upstream
+        run: |
+          airdress/scripts/feature-tests.sh --tree plain --from "$APPLIED" --report equivalence.txt
+          if grep -q ' pass$' equivalence.txt 2>/dev/null; then
+            echo "### Upstream may now do what these patches do" >> "$GITHUB_STEP_SUMMARY"
+            grep ' pass$' equivalence.txt | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+          fi

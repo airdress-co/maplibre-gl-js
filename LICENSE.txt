@@ -1,3 +1,6 @@
+Copyright (c) 2026, Airdress contributors. Changes to MapLibre GL JS, distributed
+under the same licence.
+
 Copyright (c) 2023, MapLibre contributors
 
 All rights reserved.

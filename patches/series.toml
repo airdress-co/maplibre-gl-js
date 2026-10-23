@@ -1,0 +1,30 @@
+# One entry per patch in patches/series. airdress/scripts/series-check.mjs
+# holds the two files to each other.
+#
+#   file       the patch file
+#   topic      its NNNN-<topic>.patch name, without number and extension
+#   feature    infrastructure | fit | altitude | transition | stars | security
+#   summary    one line
+#   entry      the API it adds or changes, or the flag it sits behind
+#   issue      the upstream issue it answers, if any
+#   offer      never | undecided | owner-declined | offered | merged | superseded
+#              (whether it is offered upstream is the owner's call, per patch)
+#   pr         the upstream pull request, once offered
+#   drop_when  what makes the patch unnecessary
+#   tests      the test files that prove it, run by name in CI's features job
+
+[[patch]]
+file = "0001-fork-ci.patch"
+topic = "fork-ci"
+feature = "infrastructure"
+summary = "Remove upstream's workflows and dependabot configuration from the built tree"
+offer = "never"
+drop_when = "never: upstream's release workflow publishes to npm and must not run here"
+
+[[patch]]
+file = "0002-packaging.patch"
+topic = "packaging"
+feature = "infrastructure"
+summary = "A copyright line for the fork's changes above upstream's notices; the banner links the fork's licence"
+offer = "never"
+drop_when = "never"

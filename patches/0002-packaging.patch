@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Robert Jefe Lindstaedt <robert.lindstaedt@gmail.com>
+Date: Fri, 23 Oct 2026 16:18:50 +0200
+Subject: [PATCH] Package the fork: licence line and banner
+
+The fork's builds carry one copyright line for its changes above every
+upstream notice, which is otherwise unchanged, and the banner of each built
+file links the licence at the fork's own release tag. The package keeps the
+name maplibre-gl, so no import changes; the version is set per release by
+the release commit, not by this patch.
+---
+ LICENSE.txt     | 3 +++
+ build/banner.ts | 2 +-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/LICENSE.txt b/LICENSE.txt
+index 1e8acbb54fa7baddc844377507cc5a79353174fb..8e4e0710b3d8163ca3bc0d7410435c042433b8eb 100644
+--- a/LICENSE.txt
++++ b/LICENSE.txt
+@@ -1,3 +1,6 @@
++Copyright (c) 2026, Airdress contributors. Changes to MapLibre GL JS, distributed
++under the same licence.
++
+ Copyright (c) 2023, MapLibre contributors
+ 
+ All rights reserved.
+diff --git a/build/banner.ts b/build/banner.ts
+index aa18e6faa8e768a30340ad476b8a17dd20c820f3..4678e0d56b999b15994c8d11c0abd25b26cd11ba 100644
+--- a/build/banner.ts
++++ b/build/banner.ts
+@@ -8,7 +8,7 @@ const packageJSON = JSON.parse(readFileSync(packageJSONPath, 'utf8'));
+ const banner: string =
+     `/**
+  * MapLibre GL JS
+- * @license 3-Clause BSD. Full text of license: https://github.com/maplibre/maplibre-gl-js/blob/v${packageJSON.version}/LICENSE.txt
++ * @license 3-Clause BSD. Full text of license: https://github.com/airdress-co/maplibre-gl-js/blob/v${packageJSON.version}/LICENSE.txt
+  */`;
+ 
+ export default banner;
