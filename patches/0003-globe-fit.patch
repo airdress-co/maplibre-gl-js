@@ -1,0 +1,1133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Robert Jefe Lindstaedt <robert.lindstaedt@gmail.com>
+Date: Fri, 23 Oct 2026 16:49:02 +0200
+Subject: [PATCH] Fit bounds on the globe from any start, centred and filling
+ the padding
+
+fitBounds and cameraForBounds on the globe projection missed in three ways
+(#5439):
+
+- the camera helper was chosen by the projection at the current zoom, so a
+  fit started past the globe-to-mercator transition was solved, and its
+  jump or flight constrained, as mercator, landing far off for a target on
+  the globe;
+- the zoom was corrected by one scale step from the mercator answer and the
+  center kept at the mercator middle, so country-scale bounds ended
+  off-centre by up to 90 px and short of, or past, the padded viewport,
+  sampled at corners and edge midpoints only;
+- bounds given to the constructor were fitted before the style's projection
+  was known.
+
+The fit is now solved in the projection of the fitted zoom, and on the
+sphere by a damped Newton iteration on the edges' screen offset and the
+scale still needed, starting from the bounds' spherical middle and keeping
+the first estimate when it is not improved. Jumps, eases and flights to a
+zoom with the other projection are constrained by that projection. The
+constructor fits again on the first style load unless the camera moved.
+---
+ src/geo/projection/globe_camera_helper.ts     |  99 ++++++-
+ src/geo/projection/globe_projection.ts        |  54 ++--
+ .../vertical_perspective_camera_helper.ts     | 245 +++++++++++++++++-
+ src/ui/camera.test.ts                         |  22 +-
+ src/ui/map.ts                                 |  24 ++
+ src/ui/map_tests/map_fit_bounds_globe.test.ts | 164 ++++++++++++
+ .../fit-bounds-country-landscape/expected.png | Bin 0 -> 5641 bytes
+ .../fit-bounds-country-landscape/style.json   |  69 +++++
+ .../fit-bounds-country-portrait/expected.png  | Bin 0 -> 4823 bytes
+ .../fit-bounds-country-portrait/style.json    |  69 +++++
+ 10 files changed, 710 insertions(+), 36 deletions(-)
+ create mode 100644 src/ui/map_tests/map_fit_bounds_globe.test.ts
+ create mode 100644 test/integration/render/tests/projection/globe/fit-bounds-country-landscape/expected.png
+ create mode 100644 test/integration/render/tests/projection/globe/fit-bounds-country-landscape/style.json
+ create mode 100644 test/integration/render/tests/projection/globe/fit-bounds-country-portrait/expected.png
+ create mode 100644 test/integration/render/tests/projection/globe/fit-bounds-country-portrait/style.json
+
+diff --git a/src/geo/projection/globe_camera_helper.ts b/src/geo/projection/globe_camera_helper.ts
+index aefb8881280023cc850474faa5ea3da33cabd382..0d0a3b5c941870bd65165a536351ac2ebf5e7b8f 100644
+--- a/src/geo/projection/globe_camera_helper.ts
++++ b/src/geo/projection/globe_camera_helper.ts
+@@ -45,22 +45,113 @@ export class GlobeCameraHelper implements ICameraHelper {
+         this.currentHelper.handleMapControlsPan(deltas, tr, preZoomAroundLoc);
+     }
+ 
++    /**
++     * Solves the fit in the projection the map will have at the fitted zoom, not the one it has now:
++     * a fit that starts past the globe-to-mercator transition and ends on the globe is solved on the sphere,
++     * and the reverse. The helper is switched at most twice.
++     */
+     cameraForBoxAndBearing(options: CameraForBoundsOptions, fitPadding: PaddingOptions, mapPadding: PaddingOptions, bounds: LngLatBounds, bearing: number, tr: ITransform): CameraForBoxAndBearingHandlerResult {
+-        return this.currentHelper.cameraForBoxAndBearing(options, fitPadding, mapPadding, bounds, bearing, tr);
++        let useGlobe = this.useGlobeControls;
++        let result: CameraForBoxAndBearingHandlerResult;
++        for (let attempt = 0; attempt < 3; attempt++) {
++            const candidate = tr.clone();
++            candidate.setTransitionState(useGlobe ? 1 : 0);
++            const helper = useGlobe ? this._verticalPerspectiveCameraHelper : this._mercatorCameraHelper;
++            result = helper.cameraForBoxAndBearing(options, fitPadding, mapPadding, bounds, bearing, candidate);
++            if (!result) {
++                return result;
++            }
++            const globeAtTarget = this._globe.transitionStateAtZoom(result.zoom) > 0;
++            if (globeAtTarget === useGlobe) {
++                return result;
++            }
++            useGlobe = globeAtTarget;
++        }
++        return result;
+     }
+ 
+     /**
+      * Handles the zoom and center change during camera jumpTo.
++     * A jump to a zoom with the other projection is constrained by the projection at that zoom: a jump from
++     * past the globe-to-mercator transition to a world view would otherwise have its center clamped by mercator's
++     * rules, which keep the world filling the viewport.
+      */
+     handleJumpToCenterZoom(tr: ITransform, options: { zoom?: number; center?: LngLatLike }): void {
+-        this.currentHelper.handleJumpToCenterZoom(tr, options);
++        const targetState = this._otherTransitionStateAt(options.zoom);
++        if (targetState === undefined) {
++            this.currentHelper.handleJumpToCenterZoom(tr, options);
++            return;
++        }
++        tr.setTransitionState(targetState);
++        this._helperFor(targetState).handleJumpToCenterZoom(tr, options);
+     }
+ 
++    /**
++     * Handles an easeTo. An animation that ends at a zoom with the other projection has its target computed in that
++     * projection, and its last frame constrained by it, as {@link GlobeCameraHelper.handleJumpToCenterZoom} does.
++     */
+     handleEaseTo(tr: ITransform, options: EaseToHandlerOptions): EaseToHandlerResult {
+-        return this.currentHelper.handleEaseTo(tr, options);
++        const targetState = this._otherTransitionStateAt(options.zoom);
++        if (targetState === undefined) {
++            return this.currentHelper.handleEaseTo(tr, options);
++        }
++        const result = this._inTransitionState(tr, targetState, () => this._helperFor(targetState).handleEaseTo(tr, options));
++        const easeFunc = result.easeFunc;
++        return {
++            ...result,
++            easeFunc: (k: number) => {
++                this._setTransitionStateForFrame(tr, k, targetState);
++                easeFunc(k);
++            }
++        };
+     }
+ 
++    /**
++     * Handles a flyTo, with the target and the last frame in the projection of the target zoom, as for easeTo.
++     */
+     handleFlyTo(tr: ITransform, options: FlyToHandlerOptions): FlyToHandlerResult {
+-        return this.currentHelper.handleFlyTo(tr, options);
++        const targetState = this._otherTransitionStateAt(options.zoom);
++        if (targetState === undefined) {
++            return this.currentHelper.handleFlyTo(tr, options);
++        }
++        const result = this._inTransitionState(tr, targetState, () => this._helperFor(targetState).handleFlyTo(tr, options));
++        const easeFunc = result.easeFunc;
++        return {
++            ...result,
++            easeFunc: (k: number, scale: number, centerFactor: number, pointAtOffset: Point) => {
++                this._setTransitionStateForFrame(tr, k, targetState);
++                easeFunc(k, scale, centerFactor, pointAtOffset);
++            }
++        };
++    }
++
++    /**
++     * The projection's transition state at `zoom` when it is on the other side of the globe-to-mercator transition
++     * from the current one, otherwise undefined.
++     */
++    private _otherTransitionStateAt(zoom: number | undefined): number | undefined {
++        if (typeof zoom !== 'number') {
++            return undefined;
++        }
++        const state = this._globe.transitionStateAtZoom(zoom);
++        return (state > 0) !== this.useGlobeControls ? state : undefined;
++    }
++
++    private _helperFor(transitionState: number): ICameraHelper {
++        return transitionState > 0 ? this._verticalPerspectiveCameraHelper : this._mercatorCameraHelper;
++    }
++
++    private _inTransitionState<T>(tr: ITransform, transitionState: number, run: () => T): T {
++        tr.setTransitionState(transitionState);
++        try {
++            return run();
++        } finally {
++            tr.setTransitionState(this._globe.transitionState);
++        }
++    }
++
++    /** Frames follow the projection of the zoom they start at, and the last one is in the target's. */
++    private _setTransitionStateForFrame(tr: ITransform, k: number, targetState: number): void {
++        tr.setTransitionState(k >= 1 ? targetState : this._globe.transitionStateAtZoom(tr.zoom));
+     }
+ }
+\ No newline at end of file
+diff --git a/src/geo/projection/globe_projection.ts b/src/geo/projection/globe_projection.ts
+index 5eaf2e40beb3bfdd01823d6aede01d50a25e223a..a0d4f5de530ee0264899135e36bad73661777eab 100644
+--- a/src/geo/projection/globe_projection.ts
++++ b/src/geo/projection/globe_projection.ts
+@@ -21,6 +21,7 @@ export class GlobeProjection extends Evented implements Projection {
+     _transitioning: Transitioning<ProjectionProps>;
+     _mercatorProjection: MercatorProjection;
+     _verticalPerspectiveProjection: VerticalPerspectiveProjection;
++    _lastEvaluationParameters: EvaluationParameters;
+ 
+     constructor(projection: ProjectionSpecification | undefined, globalState: Record<string, any>) {
+         super();
+@@ -33,25 +34,18 @@ export class GlobeProjection extends Evented implements Projection {
+     }
+ 
+     public get transitionState(): number {
+-        const currentProjectionSpecValue = this.properties.get('type');
+-        if (typeof currentProjectionSpecValue === 'string' && currentProjectionSpecValue === 'mercator') {
+-            return 0;
+-        }
+-        if (typeof currentProjectionSpecValue === 'string' && currentProjectionSpecValue === 'vertical-perspective') {
+-            return 1;
+-        }
+-        if (currentProjectionSpecValue instanceof ProjectionDefinition) {
+-            if (currentProjectionSpecValue.from === currentProjectionSpecValue.to) {
+-                return currentProjectionSpecValue.from === 'mercator' ? 0 : 1;
+-            }
+-            if (currentProjectionSpecValue.from === 'vertical-perspective' && currentProjectionSpecValue.to === 'mercator') {
+-                return 1 - currentProjectionSpecValue.transition;
+-            }
+-            if (currentProjectionSpecValue.from === 'mercator' && currentProjectionSpecValue.to === 'vertical-perspective') {
+-                return currentProjectionSpecValue.transition;
+-            }
+-        };
+-        return 1;
++        return transitionStateOf(this.properties.get('type'));
++    }
++
++    /**
++     * The transition state the projection would have at another zoom, with the rest of the last evaluation unchanged.
++     * A camera computed for a target zoom, such as a fit, is solved in the projection of that zoom.
++     * @param zoom - The zoom to evaluate the projection at.
++     * @returns 0 for mercator, 1 for vertical perspective, and the blend in between.
++     */
++    public transitionStateAtZoom(zoom: number): number {
++        const properties = this._transitioning.possiblyEvaluate(new EvaluationParameters(zoom, this._lastEvaluationParameters));
++        return transitionStateOf(properties.get('type'));
+     }
+ 
+     get useGlobeRendering(): boolean {
+@@ -120,6 +114,28 @@ export class GlobeProjection extends Evented implements Projection {
+     }
+ 
+     recalculate(parameters: EvaluationParameters): void {
++        this._lastEvaluationParameters = parameters;
+         this.properties = this._transitioning.possiblyEvaluate(parameters);
+     }
+ }
++
++function transitionStateOf(currentProjectionSpecValue: ProjectionPropsPossiblyEvaluated['type']): number {
++    if (typeof currentProjectionSpecValue === 'string' && currentProjectionSpecValue === 'mercator') {
++        return 0;
++    }
++    if (typeof currentProjectionSpecValue === 'string' && currentProjectionSpecValue === 'vertical-perspective') {
++        return 1;
++    }
++    if (currentProjectionSpecValue instanceof ProjectionDefinition) {
++        if (currentProjectionSpecValue.from === currentProjectionSpecValue.to) {
++            return currentProjectionSpecValue.from === 'mercator' ? 0 : 1;
++        }
++        if (currentProjectionSpecValue.from === 'vertical-perspective' && currentProjectionSpecValue.to === 'mercator') {
++            return 1 - currentProjectionSpecValue.transition;
++        }
++        if (currentProjectionSpecValue.from === 'mercator' && currentProjectionSpecValue.to === 'vertical-perspective') {
++            return currentProjectionSpecValue.transition;
++        }
++    }
++    return 1;
++}
+diff --git a/src/geo/projection/vertical_perspective_camera_helper.ts b/src/geo/projection/vertical_perspective_camera_helper.ts
+index aa4cf9b6854dbcdeddc58bb7e91fd7f4e550cbdd..a7d4ddc96481a33673ff82cb855bbf1cdf59acdc 100644
+--- a/src/geo/projection/vertical_perspective_camera_helper.ts
++++ b/src/geo/projection/vertical_perspective_camera_helper.ts
+@@ -2,7 +2,7 @@ import Point from '@mapbox/point-geometry';
+ import {cameraBoundsWarning, type CameraForBoxAndBearingHandlerResult, type EaseToHandlerResult, type EaseToHandlerOptions, type FlyToHandlerResult, type FlyToHandlerOptions, type ICameraHelper, type MapControlsDeltas, updateRotation, cameraForBoxAndBearing} from './camera_helper.ts';
+ import {LngLat, type LngLatLike} from '../lng_lat.ts';
+ import {angularCoordinatesToSurfaceVector, computeGlobePanCenter, getGlobeRadiusPixels, getZoomAdjustment, globeDistanceOfLocationsPixels, interpolateLngLatForGlobe, versorSetLocationAtPoint} from './globe_utils.ts';
+-import {clamp, createVec3f64, differenceOfAnglesDegrees, lerp, remapSaturate, rollPitchBearingEqual, scaleZoom, warnOnce, zoomScale} from '../../util/util.ts';
++import {clamp, createVec3f64, degreesToRadians, differenceOfAnglesDegrees, lerp, remapSaturate, rollPitchBearingEqual, scaleZoom, warnOnce, zoomScale} from '../../util/util.ts';
+ import {type mat4, vec3} from 'gl-matrix';
+ import {normalizeCenter} from '../transform_helper.ts';
+ import {interpolates} from '@maplibre/maplibre-gl-style-spec';
+@@ -39,6 +39,82 @@ const INTERPOLATE_TO_HEURISTIC_START_HORIZON = 0.95;
+ /** Ray distance at which the blend to heuristic zooming is complete. */
+ const INTERPOLATE_TO_HEURISTIC_END_HORIZON = 0.999;
+ 
++/** Points sampled along each edge of the bounds when fitting them: a long edge bulges on the sphere, rarely at its midpoint. */
++const FIT_SAMPLES_PER_EDGE = 8;
++
++/** Most Newton steps of a fit on the sphere. A country settles in two or three. */
++const FIT_MAX_ITERATIONS = 8;
++
++/** The finite-difference step of a fit on the sphere, for the center in pixels and for the zoom. */
++const FIT_DIFFERENCE_PIXELS = 1;
++const FIT_DIFFERENCE_ZOOM = 0.01;
++
++/** The largest zoom step of a fit on the sphere. */
++const FIT_MAX_STEP_ZOOM = 1;
++
++/** How much more a fit on the sphere weighs bounds reaching past the padded viewport than bounds short of it. */
++const FIT_OUTSIDE_WEIGHT = 10;
++
++/** The largest center step of a fit, as a fraction of the globe's radius on screen. */
++const FIT_MAX_STEP_GLOBE_RADII = 0.2;
++
++/** A fit on the sphere is settled when the bounds are this close, in pixels, to centred and to filling the padded viewport. */
++const FIT_TOLERANCE_PIXELS = 0.25;
++
++/**
++ * The direction of the mean of the points on the unit sphere, as a location, or undefined if they cancel out.
++ */
++function sphericalMiddle(points: LngLat[]): LngLat | undefined {
++    let x = 0, y = 0, z = 0;
++    for (const point of points) {
++        const v = angularCoordinatesToSurfaceVector(point);
++        x += v[0];
++        y += v[1];
++        z += v[2];
++    }
++    const length = Math.hypot(x, y, z);
++    if (length < 1e-9) {
++        return undefined;
++    }
++    return new LngLat(Math.atan2(x, z) * 180 / Math.PI, Math.asin(clamp(y / length, -1, 1)) * 180 / Math.PI);
++}
++
++/**
++ * Solves the 3x3 system whose columns are given, by Cramer's rule, or undefined if it is singular.
++ */
++function solve3(columns: Array<[number, number, number]>, b: [number, number, number]): [number, number, number] | undefined {
++    const det = (a: [number, number, number], c: [number, number, number], d: [number, number, number]) =>
++        a[0] * (c[1] * d[2] - c[2] * d[1]) - c[0] * (a[1] * d[2] - a[2] * d[1]) + d[0] * (a[1] * c[2] - a[2] * c[1]);
++    const [c0, c1, c2] = columns;
++    const d = det(c0, c1, c2);
++    if (!Number.isFinite(d) || Math.abs(d) < 1e-12) {
++        return undefined;
++    }
++    return [det(b, c1, c2) / d, det(c0, b, c2) / d, det(c0, c1, b) / d];
++}
++
++/**
++ * Points along the four edges of the bounds, going around them.
++ * @param bounds - The bounds; an east edge past 180 crosses the antimeridian.
++ * @param perEdge - Points per edge, corners included once.
++ */
++function sampleBoundsEdges(bounds: LngLatBounds, perEdge: number): LngLat[] {
++    const west = bounds.getWest();
++    const east = bounds.getEast();
++    const south = bounds.getSouth();
++    const north = bounds.getNorth();
++    const samples: LngLat[] = [];
++    for (let i = 0; i < perEdge; i++) {
++        const t = i / perEdge;
++        samples.push(
++            new LngLat(lerp(west, east, t), north),
++            new LngLat(east, lerp(north, south, t)),
++            new LngLat(lerp(east, west, t), south),
++            new LngLat(west, lerp(south, north, t)));
++    }
++    return samples;
++}
++
+ /**
+  * Globe radius relative to the smaller viewport dimension below which zoom movement near the horizon
+  * starts being inhibited, avoiding unnatural movements when the map is zoomed out a lot.
+@@ -238,7 +314,172 @@ export class VerticalPerspectiveCameraHelper implements ICameraHelper {
+ 
+         // Compute target zoom from the obtained scale.
+         result.zoom = Math.min(clonedTr.zoom + scaleZoom(smallestNeededScale), options.maxZoom);
+-        return result;
++        return VerticalPerspectiveCameraHelper.refineFitOnSphere(result, options, fitPadding, mapPadding, bounds, clonedTr);
++    }
++
++    /**
++     * Refines a fit on the sphere. On a perspective globe neither the projected size of the bounds nor their
++     * position is linear in the zoom, and the projected bounds are not symmetric about their mercator middle,
++     * so one scale step from the mercator answer leaves the bounds off-centre and short of, or past, the padded
++     * viewport. This solves for the center and zoom at which the projected edges are centred in the padded
++     * viewport and fill it, sampling every edge rather than its corners and midpoints, by a damped Newton
++     * iteration on the screen offset of the bounds and the log of the scale still needed.
++     * @param initial - The first estimate; its zoom is the starting zoom and its bearing is kept.
++     * @param options - The fit options: `offset` and `maxZoom` are honoured.
++     * @param fitPadding - The padding of the fit.
++     * @param mapPadding - The map's own padding.
++     * @param bounds - The bounds to fit.
++     * @param tr - A transform with the map's size, padding, bearing and a pitch of 0. It is modified.
++     * @returns The refined camera, or `initial` when no camera shows all of the bounds.
++     */
++    static refineFitOnSphere(initial: CameraForBoxAndBearingHandlerResult, options: CameraForBoundsOptions, fitPadding: PaddingOptions, mapPadding: PaddingOptions, bounds: LngLatBounds, tr: ITransform): CameraForBoxAndBearingHandlerResult {
++        const left = mapPadding.left + fitPadding.left;
++        const top = mapPadding.top + fitPadding.top;
++        const availableWidth = tr.width - left - mapPadding.right - fitPadding.right;
++        const availableHeight = tr.height - top - mapPadding.bottom - fitPadding.bottom;
++        if (availableWidth <= 0 || availableHeight <= 0) {
++            return initial;
++        }
++        const offset = Point.convert(options.offset ?? [0, 0]).rotate(degreesToRadians(-initial.bearing));
++        const target = new Point(left + availableWidth / 2, top + availableHeight / 2).add(offset);
++        const samples = sampleBoundsEdges(bounds, FIT_SAMPLES_PER_EDGE);
++        const minZoom = tr.minZoom;
++        const maxZoom = Math.min(options.maxZoom ?? tr.maxZoom, tr.maxZoom);
++
++        // What is left to do at a camera: [x and y offset of the bounds from where they belong, in pixels;
++        // log2 of the scale they still need], or undefined when part of them is behind the planet.
++        const residual = (center: LngLat, zoom: number): [number, number, number] | undefined => {
++            tr.setCenter(center);
++            tr.setZoom(zoom);
++            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
++            for (const sample of samples) {
++                if (tr.isLocationOccluded(sample)) {
++                    return undefined;
++                }
++                const p = tr.locationToScreenPoint(sample);
++                if (p.x < minX) minX = p.x;
++                if (p.y < minY) minY = p.y;
++                if (p.x > maxX) maxX = p.x;
++                if (p.y > maxY) maxY = p.y;
++            }
++            // The scale that brings the side of the bounds farthest from where they belong to its padded edge.
++            // It is the scale that fills the padded viewport once the bounds are centred, and keeps them inside it
++            // when they cannot be, as when the center would have to pass the latitude the zoom allows.
++            const halfWidth = availableWidth / 2;
++            const halfHeight = availableHeight / 2;
++            const scale = Math.min(
++                halfWidth / Math.max(target.x - minX, maxX - target.x),
++                halfHeight / Math.max(target.y - minY, maxY - target.y));
++            let zoomNeeded = scaleZoom(scale);
++            // At a zoom limit, the scale it cannot give is not asked for.
++            if ((zoomNeeded > 0 && zoom >= maxZoom) || (zoomNeeded < 0 && zoom <= minZoom)) {
++                zoomNeeded = 0;
++            }
++            return [target.x - (minX + maxX) / 2, target.y - (minY + maxY) / 2, zoomNeeded];
++        };
++        // In pixels. A sum, so a step that improves the zoom counts while the center cannot move further, and
++        // bounds that reach past the padded viewport weigh ten times as much as bounds short of it.
++        const size = (r: [number, number, number]) => Math.abs(r[0]) + Math.abs(r[1]) +
++            Math.abs(r[2]) * Math.max(availableWidth, availableHeight) * (r[2] < 0 ? FIT_OUTSIDE_WEIGHT : 1);
++        // The camera after moving what is under the center point by (dx, dy) pixels and zooming by dz.
++        const moved = (center: LngLat, zoom: number, dx: number, dy: number, dz: number): [LngLat, number] => {
++            tr.setCenter(center);
++            tr.setZoom(zoom);
++            return [tr.screenPointToLocation(tr.centerPoint.sub(new Point(dx, dy))), clamp(zoom + dz, minZoom, maxZoom)];
++        };
++
++        // How far the bounds reach past the padded viewport, and how far they are from centred and filling it, in
++        // pixels; undefined when part of them is behind the planet.
++        const fitQuality = (center: LngLat, zoom: number): {outside: number; misfit: number} | undefined => {
++            tr.setCenter(center);
++            tr.setZoom(zoom);
++            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
++            for (const sample of samples) {
++                if (tr.isLocationOccluded(sample)) {
++                    return undefined;
++                }
++                const p = tr.locationToScreenPoint(sample);
++                if (p.x < minX) minX = p.x;
++                if (p.y < minY) minY = p.y;
++                if (p.x > maxX) maxX = p.x;
++                if (p.y > maxY) maxY = p.y;
++            }
++            const gaps = [minX - left, left + availableWidth - maxX, minY - top, top + availableHeight - maxY];
++            return {
++                outside: Math.max(0, -Math.min(...gaps)),
++                misfit: Math.abs(gaps[0] - gaps[1]) / 2 + Math.abs(gaps[2] - gaps[3]) / 2 + Math.max(0, Math.min(Math.min(gaps[0], gaps[1]), Math.min(gaps[2], gaps[3]))),
++            };
++        };
++
++        // Start from the middle of the bounds on the sphere: the mercator middle lies poleward of it, far so for
++        // bounds reaching high latitudes. Zoom out until all of the bounds are in front of the planet.
++        let center = sphericalMiddle(samples) ?? LngLat.convert(initial.center);
++        let zoom = clamp(initial.zoom, minZoom, maxZoom);
++        let r = residual(center, zoom);
++        while (!r && zoom > minZoom) {
++            zoom = Math.max(minZoom, zoom - 0.5);
++            r = residual(center, zoom);
++        }
++        if (!r) {
++            return initial;
++        }
++
++        for (let i = 0; i < FIT_MAX_ITERATIONS && size(r) > FIT_TOLERANCE_PIXELS; i++) {
++            // The Jacobian by forward differences, one column per unknown.
++            const columns: Array<[number, number, number]> = [];
++            for (const [dx, dy, dz] of [[FIT_DIFFERENCE_PIXELS, 0, 0], [0, FIT_DIFFERENCE_PIXELS, 0], [0, 0, FIT_DIFFERENCE_ZOOM]]) {
++                const [c, z] = moved(center, zoom, dx, dy, dz);
++                const rd = residual(c, z);
++                const h = dx || dy || dz;
++                columns.push(rd ? [(rd[0] - r[0]) / h, (rd[1] - r[1]) / h, (rd[2] - r[2]) / h] : [dx ? -1 : 0, dy ? -1 : 0, dz ? -1 : 0]);
++            }
++            // Keep a step well inside the globe's disc, where a screen point still names a nearby location.
++            const maxStep = FIT_MAX_STEP_GLOBE_RADII * getGlobeRadiusPixels(tr.worldSize, center.lat);
++            const limited = ([dx, dy, dz]: [number, number, number]): [number, number, number] => {
++                const limit = Math.min(1, maxStep / (Math.hypot(dx, dy) || 1), FIT_MAX_STEP_ZOOM / (Math.abs(dz) || 1));
++                return [dx * limit, dy * limit, dz * limit];
++            };
++            // The Newton step first; then the zoom alone and the center alone, for when the center is held by
++            // the latitude the zoom allows and the coupled step cannot improve.
++            const candidates: Array<[number, number, number]> = [
++                solve3(columns, [-r[0], -r[1], -r[2]]) ?? [r[0], r[1], r[2]],
++                [0, 0, r[2]],
++                [r[0], r[1], 0],
++            ];
++            let accepted = false;
++            for (const candidate of candidates) {
++                let step = limited(candidate);
++                // Backtrack until the step improves the fit.
++                for (let k = 0; k < 6 && !accepted; k++) {
++                    const [c, z] = moved(center, zoom, step[0], step[1], step[2]);
++                    const rc = residual(c, z);
++                    if (rc && size(rc) < size(r)) {
++                        center = c;
++                        zoom = z;
++                        r = rc;
++                        accepted = true;
++                    } else {
++                        step = [step[0] / 2, step[1] / 2, step[2] / 2];
++                    }
++                }
++                if (accepted) {
++                    break;
++                }
++            }
++            if (!accepted) {
++                break;
++            }
++        }
++        // Bounds wrapping far around the globe near a pole can lead the steps astray: keep the first estimate
++        // unless the refined camera is better, containment first.
++        const refined = fitQuality(center, zoom);
++        const first = fitQuality(LngLat.convert(initial.center), initial.zoom);
++        const better = refined && (!first || refined.outside < first.outside - FIT_TOLERANCE_PIXELS ||
++            (Math.abs(refined.outside - first.outside) <= FIT_TOLERANCE_PIXELS && refined.misfit < first.misfit));
++        if (!better) {
++            return initial;
++        }
++        return {center: center.wrap(), zoom, bearing: initial.bearing};
+     }
+ 
+     /**
+diff --git a/src/ui/camera.test.ts b/src/ui/camera.test.ts
+index b4de3604d11fbc0bb747e7f4395c6a0bf18b47c4..7cd01c60a208d6a7e97f926b4219483d953e74d8 100644
+--- a/src/ui/camera.test.ts
++++ b/src/ui/camera.test.ts
+@@ -3952,8 +3952,8 @@ describe('fitBounds globe projection', () => {
+         const bb = [[-133, 16], [-68, 50]] as [LngLatLike, LngLatLike];
+         camera.fitBounds(bb, {duration: 0});
+ 
+-        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -100.5, lat: 34.7171});
+-        expect(fixedNum(camera.getZoom(), 3)).toBe(2.496);
++        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -100.5, lat: 34.2318});
++        expect(fixedNum(camera.getZoom(), 3)).toBe(2.503);
+     });
+ 
+     test('padding number', () => {
+@@ -3961,8 +3961,8 @@ describe('fitBounds globe projection', () => {
+         const bb = [[-133, 16], [-68, 50]] as [LngLatLike, LngLatLike];
+         camera.fitBounds(bb, {padding: 15, duration: 0});
+ 
+-        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -100.5, lat: 34.7171});
+-        expect(fixedNum(camera.getZoom(), 3)).toBe(2.399);
++        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -100.5, lat: 34.2642});
++        expect(fixedNum(camera.getZoom(), 3)).toBe(2.405);
+     });
+ 
+     test('padding object', () => {
+@@ -3970,7 +3970,7 @@ describe('fitBounds globe projection', () => {
+         const bb = [[-133, 16], [-68, 50]] as [LngLatLike, LngLatLike];
+         camera.fitBounds(bb, {padding: {top: 10, right: 75, bottom: 50, left: 25}, duration: 0});
+ 
+-        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -96.5558, lat: 32.0833});
++        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -95.341, lat: 31.5642});
+     });
+ 
+     test('padding does not get propagated to transform.padding', () => {
+@@ -4012,8 +4012,8 @@ describe('fitScreenCoordinates globe projection', () => {
+         const bearing = 225;
+         camera.fitScreenCoordinates(p0, p1, bearing, {duration: 0});
+ 
+-        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -5.9948, lat: 5.8987});
+-        expect(fixedNum(camera.getZoom(), 3)).toBe(4.454);
++        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -5.9948, lat: 5.8892});
++        expect(fixedNum(camera.getZoom(), 3)).toBe(4.456);
+         expect(camera.getBearing()).toBe(-135);
+     });
+ 
+@@ -4024,8 +4024,8 @@ describe('fitScreenCoordinates globe projection', () => {
+         const bearing = 0;
+         camera.fitScreenCoordinates(p0, p1, bearing, {duration: 0});
+ 
+-        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -5.9948, lat: 5.8987});
+-        expect(fixedNum(camera.getZoom(), 3)).toBe(4.936);
++        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -5.9948, lat: 5.8678});
++        expect(fixedNum(camera.getZoom(), 3)).toBe(4.934);
+         expect(camera.getBearing()).toBeCloseTo(0);
+     });
+ 
+@@ -4036,8 +4036,8 @@ describe('fitScreenCoordinates globe projection', () => {
+         const bearing = 0;
+         camera.fitScreenCoordinates(p0, p1, bearing, {duration: 0});
+ 
+-        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -5.9948, lat: 5.8987});
+-        expect(fixedNum(camera.getZoom(), 3)).toBe(4.936);
++        expect(fixedLngLat(camera.getCenter(), 4)).toEqual({lng: -5.9948, lat: 5.8678});
++        expect(fixedNum(camera.getZoom(), 3)).toBe(4.934);
+         expect(camera.getBearing()).toBeCloseTo(0);
+     });
+ });
+diff --git a/src/ui/map.ts b/src/ui/map.ts
+index 4af3c4dfa7e5dc4393537f40db6647cb9a4b854a..7999f0bd016c3a3fa0110b76f1a445e76f181573 100644
+--- a/src/ui/map.ts
++++ b/src/ui/map.ts
+@@ -868,6 +868,12 @@ export class Map extends Evented<MapEventType> {
+         const shouldConstrainUsingMercatorTransform = styleProjectionType !== 'globe' && !getRegisteredProjection(styleProjectionType);
+         this.resize(null, shouldConstrainUsingMercatorTransform);
+ 
++        // The bounds were fitted before the style's projection was known. Fit them again once it is,
++        // unless the camera has moved since.
++        if (resolvedOptions.bounds && resolvedOptions.style && !this._hash) {
++            this._fitBoundsOnStyleLoad(resolvedOptions.bounds, resolvedOptions.fitBoundsOptions);
++        }
++
+         this._localIdeographFontFamily = resolvedOptions.localIdeographFontFamily;
+         this._validateStyle = resolvedOptions.validateStyle;
+         this._initialGlobalState = resolvedOptions.globalState;
+@@ -900,6 +906,24 @@ export class Map extends Evented<MapEventType> {
+         });
+     }
+ 
++    /**
++     * @internal
++     * Fits `bounds` again when the first style has loaded, unless the camera moved before that.
++     * @param bounds - The bounds given to the constructor.
++     * @param fitBoundsOptions - The constructor's fit options.
++     */
++    _fitBoundsOnStyleLoad(bounds: LngLatBoundsLike, fitBoundsOptions?: FitBoundsOptions): void {
++        let moved = false;
++        const onMoveStart = () => { moved = true; };
++        this.once('movestart', onMoveStart);
++        this.once('style.load', () => {
++            this.off('movestart', onMoveStart);
++            if (!moved) {
++                this.fitBounds(bounds, extend({}, fitBoundsOptions, {duration: 0}));
++            }
++        });
++    }
++
+     /**
+      * @internal
+      * Returns a unique number for this map instance which is used for the MapLoadEvent
+diff --git a/src/ui/map_tests/map_fit_bounds_globe.test.ts b/src/ui/map_tests/map_fit_bounds_globe.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cf19a3e0b7ee319f60aded0882d52d53b525c48
+--- /dev/null
++++ b/src/ui/map_tests/map_fit_bounds_globe.test.ts
+@@ -0,0 +1,164 @@
++import {beforeEach, describe, expect, test} from 'vitest';
++import {beforeMapTest} from '../../util/test/util.ts';
++import {Map} from '../map.ts';
++import {LngLat} from '../../geo/lng_lat.ts';
++
++import type {PaddingOptions} from '../../geo/edge_insets.ts';
++
++beforeEach(() => {
++    beforeMapTest();
++    global.fetch = null;
++});
++
++const globeStyle = {version: 8 as const, sources: {}, layers: [], projection: {type: 'globe' as const}};
++
++function createSizedMap(width: number, height: number, options: Record<string, unknown> = {}): Map {
++    const container = window.document.createElement('div');
++    Object.defineProperty(container, 'clientWidth', {value: width, configurable: true});
++    Object.defineProperty(container, 'clientHeight', {value: height, configurable: true});
++    return new Map({container, interactive: false, attributionControl: false, maplibreLogo: false, style: globeStyle, ...options} as any);
++}
++
++type Box = [[number, number], [number, number]];
++
++const BOUNDS: Record<string, Box> = {
++    germany: [[5.87, 47.27], [15.04, 55.06]],
++    norway: [[4.5, 57.9], [31.2, 71.2]],
++    brazil: [[-73.99, -33.75], [-34.79, 5.27]],
++    chile: [[-75.7, -55.98], [-66.4, -17.5]],
++    russia: [[19.6, 41.2], [191.0, 81.9]],
++    fijiAcrossTheAntimeridian: [[177.0, -21.0], [182.0, -12.0]],
++    africa: [[-17.6, -34.9], [51.4, 37.4]],
++    berlinMitte: [[13.37, 52.5], [13.42, 52.53]],
++};
++
++// Russia reaches 82N: with more padding at the top than at the bottom, centring it needs a center further north
++// than the globe lets the center go at that zoom. It is fitted inside the padded viewport, neither centred nor
++// as large as it could be.
++const CENTER_OUT_OF_REACH = new Set(['russia, uneven']);
++
++const PADDINGS: Record<string, PaddingOptions> = {
++    none: {top: 0, bottom: 0, left: 0, right: 0},
++    even: {top: 80, bottom: 80, left: 80, right: 80},
++    uneven: {top: 120, bottom: 40, left: 20, right: 100},
++};
++
++const VIEWPORTS: Record<string, [number, number]> = {
++    phone: [360, 800],
++    desktop: [1440, 900],
++};
++
++const START_ZOOMS: Record<string, number> = {
++    globe: 1,
++    transition: 11.5,
++    mercator: 14,
++};
++
++function edgeSamples([[west, south], [east, north]]: Box, perEdge: number): LngLat[] {
++    const samples: LngLat[] = [];
++    for (let i = 0; i < perEdge; i++) {
++        const t = i / perEdge;
++        samples.push(
++            new LngLat(west + (east - west) * t, north),
++            new LngLat(east, north + (south - north) * t),
++            new LngLat(east + (west - east) * t, south),
++            new LngLat(west, south + (north - south) * t));
++    }
++    return samples;
++}
++
++/** Where the bounds' edges land after the fit, against the padded viewport. */
++function measureFit(map: Map, box: Box, padding: PaddingOptions, width: number, height: number) {
++    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
++    for (const lngLat of edgeSamples(box, 16)) {
++        const p = map.project(lngLat);
++        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
++        minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
++    }
++    const left = minX - padding.left;
++    const right = width - padding.right - maxX;
++    const top = minY - padding.top;
++    const bottom = height - padding.bottom - maxY;
++    return {
++        outside: -Math.min(left, right, top, bottom),
++        // The smallest gap to a padded edge: 0 when the bounds touch one.
++        slack: Math.max(0, Math.min(left, right, top, bottom)),
++        horizontalOffset: (left - right) / 2,
++        verticalOffset: (top - bottom) / 2,
++    };
++}
++
++describe('fitBounds on the globe', () => {
++    for (const [viewportName, [width, height]] of Object.entries(VIEWPORTS)) {
++        for (const [boundsName, box] of Object.entries(BOUNDS)) {
++            for (const [paddingName, padding] of Object.entries(PADDINGS)) {
++                for (const [startName, startZoom] of Object.entries(START_ZOOMS)) {
++                    const name = `${boundsName}, ${viewportName}, ${paddingName} padding, from ${startName}`;
++                    const fit = async () => {
++                        const map = createSizedMap(width, height);
++                        await map.once('style.load');
++                        const middle = new LngLat((box[0][0] + box[1][0]) / 2, (box[0][1] + box[1][1]) / 2).wrap();
++                        map.jumpTo({center: startZoom < 5 ? [0, 20] : middle, zoom: startZoom});
++                        map.redraw();
++
++                        map.fitBounds(box, {padding, animate: false});
++                        map.redraw();
++                        const measured = measureFit(map, box, padding, width, height);
++                        map.remove();
++                        return measured;
++                    };
++
++                    test(`${name}: every edge point is inside the padded viewport`, async () => {
++                        expect((await fit()).outside).toBeLessThanOrEqual(1);
++                    });
++
++                    // Unless the center would have to pass the latitude the zoom allows.
++                    test.skipIf(CENTER_OUT_OF_REACH.has(`${boundsName}, ${paddingName}`))(`${name}: the bounds are centred and fill the padded viewport`, async () => {
++                        const measured = await fit();
++                        expect(measured.slack).toBeLessThanOrEqual(1);
++                        expect(Math.abs(measured.horizontalOffset)).toBeLessThanOrEqual(1);
++                        expect(Math.abs(measured.verticalOffset)).toBeLessThanOrEqual(1);
++                    });
++                }
++            }
++        }
++    }
++
++    test('a map constructed with bounds and a globe style lands where fitBounds does after load', async () => {
++        for (const box of [BOUNDS.germany, BOUNDS.norway, BOUNDS.brazil]) {
++            const constructed = createSizedMap(1440, 900, {bounds: box});
++            await constructed.once('style.load');
++
++            const fitted = createSizedMap(1440, 900);
++            await fitted.once('style.load');
++            fitted.fitBounds(box, {animate: false});
++
++            expect(constructed.getZoom()).toBeCloseTo(fitted.getZoom(), 6);
++            expect(constructed.getCenter().lng).toBeCloseTo(fitted.getCenter().lng, 6);
++            expect(constructed.getCenter().lat).toBeCloseTo(fitted.getCenter().lat, 6);
++            constructed.remove();
++            fitted.remove();
++        }
++    });
++
++    test('a map constructed with bounds keeps a camera moved before the style loads', async () => {
++        const map = createSizedMap(1440, 900, {bounds: BOUNDS.germany});
++        map.jumpTo({center: [100, 10], zoom: 3});
++        await map.once('style.load');
++
++        expect(map.getZoom()).toBeCloseTo(3, 6);
++        expect(map.getCenter().lng).toBeCloseTo(100, 6);
++        map.remove();
++    });
++
++    test('a box that cannot be seen whole on a globe still gives a camera', async () => {
++        const map = createSizedMap(1440, 900);
++        await map.once('style.load');
++
++        const camera = map.cameraForBounds([[-180, -85], [180, 85]]);
++
++        expect(camera).toBeDefined();
++        expect(Number.isFinite(camera.zoom)).toBe(true);
++        map.remove();
++    });
++});
+diff --git a/test/integration/render/tests/projection/globe/fit-bounds-country-landscape/expected.png b/test/integration/render/tests/projection/globe/fit-bounds-country-landscape/expected.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9dd62dc0f3f26917f8fbbeb51f6435b96e8a2ff
+GIT binary patch
+literal 5641
+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
+WfsaAH6AMthV%xX5k!u|T(*6gQvEpt3
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/integration/render/tests/projection/globe/fit-bounds-country-landscape/style.json b/test/integration/render/tests/projection/globe/fit-bounds-country-landscape/style.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fb3406a3af37ed5a9daef51daca85970282e739
+--- /dev/null
++++ b/test/integration/render/tests/projection/globe/fit-bounds-country-landscape/style.json
+@@ -0,0 +1,69 @@
++{
++  "version": 8,
++  "metadata": {
++    "test": {
++      "width": 360,
++      "height": 225,
++      "operations": [
++        [
++          "fitBounds",
++          [
++            [
++              4.5,
++              57.9
++            ],
++            [
++              31.2,
++              71.2
++            ]
++          ],
++          {
++            "padding": 10,
++            "animate": false
++          }
++        ],
++        [
++          "wait"
++        ]
++      ]
++    }
++  },
++  "sky": {
++    "atmosphere-blend": 0.0
++  },
++  "center": [
++    0,
++    0
++  ],
++  "zoom": 14,
++  "projection": {
++    "type": "globe"
++  },
++  "sources": {
++    "bounds": {
++      "type": "geojson",
++      "data": {
++        "type": "LineString",
++        "coordinates": [[4.5, 71.2], [5.3344, 71.2], [6.1688, 71.2], [7.0031, 71.2], [7.8375, 71.2], [8.6719, 71.2], [9.5062, 71.2], [10.3406, 71.2], [11.175, 71.2], [12.0094, 71.2], [12.8438, 71.2], [13.6781, 71.2], [14.5125, 71.2], [15.3469, 71.2], [16.1812, 71.2], [17.0156, 71.2], [17.85, 71.2], [18.6844, 71.2], [19.5187, 71.2], [20.3531, 71.2], [21.1875, 71.2], [22.0219, 71.2], [22.8562, 71.2], [23.6906, 71.2], [24.525, 71.2], [25.3594, 71.2], [26.1937, 71.2], [27.0281, 71.2], [27.8625, 71.2], [28.6969, 71.2], [29.5312, 71.2], [30.3656, 71.2], [31.2, 71.2], [31.2, 70.7844], [31.2, 70.3688], [31.2, 69.9531], [31.2, 69.5375], [31.2, 69.1219], [31.2, 68.7062], [31.2, 68.2906], [31.2, 67.875], [31.2, 67.4594], [31.2, 67.0438], [31.2, 66.6281], [31.2, 66.2125], [31.2, 65.7969], [31.2, 65.3812], [31.2, 64.9656], [31.2, 64.55], [31.2, 64.1344], [31.2, 63.7188], [31.2, 63.3031], [31.2, 62.8875], [31.2, 62.4719], [31.2, 62.0562], [31.2, 61.6406], [31.2, 61.225], [31.2, 60.8094], [31.2, 60.3937], [31.2, 59.9781], [31.2, 59.5625], [31.2, 59.1469], [31.2, 58.7313], [31.2, 58.3156], [31.2, 57.9], [30.3656, 57.9], [29.5312, 57.9], [28.6969, 57.9], [27.8625, 57.9], [27.0281, 57.9], [26.1938, 57.9], [25.3594, 57.9], [24.525, 57.9], [23.6906, 57.9], [22.8562, 57.9], [22.0219, 57.9], [21.1875, 57.9], [20.3531, 57.9], [19.5187, 57.9], [18.6844, 57.9], [17.85, 57.9], [17.0156, 57.9], [16.1812, 57.9], [15.3469, 57.9], [14.5125, 57.9], [13.6781, 57.9], [12.8438, 57.9], [12.0094, 57.9], [11.175, 57.9], [10.3406, 57.9], [9.5063, 57.9], [8.6719, 57.9], [7.8375, 57.9], [7.0031, 57.9], [6.1687, 57.9], [5.3344, 57.9], [4.5, 57.9], [4.5, 58.3156], [4.5, 58.7312], [4.5, 59.1469], [4.5, 59.5625], [4.5, 59.9781], [4.5, 60.3937], [4.5, 60.8094], [4.5, 61.225], [4.5, 61.6406], [4.5, 62.0562], [4.5, 62.4719], [4.5, 62.8875], [4.5, 63.3031], [4.5, 63.7188], [4.5, 64.1344], [4.5, 64.55], [4.5, 64.9656], [4.5, 65.3812], [4.5, 65.7969], [4.5, 66.2125], [4.5, 66.6281], [4.5, 67.0438], [4.5, 67.4594], [4.5, 67.875], [4.5, 68.2906], [4.5, 68.7062], [4.5, 69.1219], [4.5, 69.5375], [4.5, 69.9531], [4.5, 70.3688], [4.5, 70.7844], [4.5, 71.2]]
++      }
++    }
++  },
++  "layers": [
++    {
++      "id": "background",
++      "type": "background",
++      "paint": {
++        "background-color": "white"
++      }
++    },
++    {
++      "id": "bounds",
++      "type": "line",
++      "source": "bounds",
++      "paint": {
++        "line-color": "red",
++        "line-width": 1
++      }
++    }
++  ]
++}
+diff --git a/test/integration/render/tests/projection/globe/fit-bounds-country-portrait/expected.png b/test/integration/render/tests/projection/globe/fit-bounds-country-portrait/expected.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..385fcde3e2c49469f0d2f3a588b213f7ed01c930
+GIT binary patch
+literal 4823
+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
+az)al#kaQRZD1v`j$!u`(qFtvj68;0df%ZHA
+
+literal 0
+HcmV?d00001
+
+diff --git a/test/integration/render/tests/projection/globe/fit-bounds-country-portrait/style.json b/test/integration/render/tests/projection/globe/fit-bounds-country-portrait/style.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fe45a1cd4624c3604f76235f1df4a3a5759977d
+--- /dev/null
++++ b/test/integration/render/tests/projection/globe/fit-bounds-country-portrait/style.json
+@@ -0,0 +1,69 @@
++{
++  "version": 8,
++  "metadata": {
++    "test": {
++      "width": 180,
++      "height": 400,
++      "operations": [
++        [
++          "fitBounds",
++          [
++            [
++              4.5,
++              57.9
++            ],
++            [
++              31.2,
++              71.2
++            ]
++          ],
++          {
++            "padding": 10,
++            "animate": false
++          }
++        ],
++        [
++          "wait"
++        ]
++      ]
++    }
++  },
++  "sky": {
++    "atmosphere-blend": 0.0
++  },
++  "center": [
++    0,
++    0
++  ],
++  "zoom": 14,
++  "projection": {
++    "type": "globe"
++  },
++  "sources": {
++    "bounds": {
++      "type": "geojson",
++      "data": {
++        "type": "LineString",
++        "coordinates": [[4.5, 71.2], [5.3344, 71.2], [6.1688, 71.2], [7.0031, 71.2], [7.8375, 71.2], [8.6719, 71.2], [9.5062, 71.2], [10.3406, 71.2], [11.175, 71.2], [12.0094, 71.2], [12.8438, 71.2], [13.6781, 71.2], [14.5125, 71.2], [15.3469, 71.2], [16.1812, 71.2], [17.0156, 71.2], [17.85, 71.2], [18.6844, 71.2], [19.5187, 71.2], [20.3531, 71.2], [21.1875, 71.2], [22.0219, 71.2], [22.8562, 71.2], [23.6906, 71.2], [24.525, 71.2], [25.3594, 71.2], [26.1937, 71.2], [27.0281, 71.2], [27.8625, 71.2], [28.6969, 71.2], [29.5312, 71.2], [30.3656, 71.2], [31.2, 71.2], [31.2, 70.7844], [31.2, 70.3688], [31.2, 69.9531], [31.2, 69.5375], [31.2, 69.1219], [31.2, 68.7062], [31.2, 68.2906], [31.2, 67.875], [31.2, 67.4594], [31.2, 67.0438], [31.2, 66.6281], [31.2, 66.2125], [31.2, 65.7969], [31.2, 65.3812], [31.2, 64.9656], [31.2, 64.55], [31.2, 64.1344], [31.2, 63.7188], [31.2, 63.3031], [31.2, 62.8875], [31.2, 62.4719], [31.2, 62.0562], [31.2, 61.6406], [31.2, 61.225], [31.2, 60.8094], [31.2, 60.3937], [31.2, 59.9781], [31.2, 59.5625], [31.2, 59.1469], [31.2, 58.7313], [31.2, 58.3156], [31.2, 57.9], [30.3656, 57.9], [29.5312, 57.9], [28.6969, 57.9], [27.8625, 57.9], [27.0281, 57.9], [26.1938, 57.9], [25.3594, 57.9], [24.525, 57.9], [23.6906, 57.9], [22.8562, 57.9], [22.0219, 57.9], [21.1875, 57.9], [20.3531, 57.9], [19.5187, 57.9], [18.6844, 57.9], [17.85, 57.9], [17.0156, 57.9], [16.1812, 57.9], [15.3469, 57.9], [14.5125, 57.9], [13.6781, 57.9], [12.8438, 57.9], [12.0094, 57.9], [11.175, 57.9], [10.3406, 57.9], [9.5063, 57.9], [8.6719, 57.9], [7.8375, 57.9], [7.0031, 57.9], [6.1687, 57.9], [5.3344, 57.9], [4.5, 57.9], [4.5, 58.3156], [4.5, 58.7312], [4.5, 59.1469], [4.5, 59.5625], [4.5, 59.9781], [4.5, 60.3937], [4.5, 60.8094], [4.5, 61.225], [4.5, 61.6406], [4.5, 62.0562], [4.5, 62.4719], [4.5, 62.8875], [4.5, 63.3031], [4.5, 63.7188], [4.5, 64.1344], [4.5, 64.55], [4.5, 64.9656], [4.5, 65.3812], [4.5, 65.7969], [4.5, 66.2125], [4.5, 66.6281], [4.5, 67.0438], [4.5, 67.4594], [4.5, 67.875], [4.5, 68.2906], [4.5, 68.7062], [4.5, 69.1219], [4.5, 69.5375], [4.5, 69.9531], [4.5, 70.3688], [4.5, 70.7844], [4.5, 71.2]]
++      }
++    }
++  },
++  "layers": [
++    {
++      "id": "background",
++      "type": "background",
++      "paint": {
++        "background-color": "white"
++      }
++    },
++    {
++      "id": "bounds",
++      "type": "line",
++      "source": "bounds",
++      "paint": {
++        "line-color": "red",
++        "line-width": 1
++      }
++    }
++  ]
++}
