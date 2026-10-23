@@ -31,11 +31,12 @@ constructor fits again on the first style load unless the camera moved.
  src/ui/camera.test.ts                         |  22 +-
  src/ui/map.ts                                 |  24 ++
  src/ui/map_tests/map_fit_bounds_globe.test.ts | 164 ++++++++++++
+ test/build/bundle_size.json                   |   8 +-
  .../fit-bounds-country-landscape/expected.png | Bin 0 -> 5641 bytes
  .../fit-bounds-country-landscape/style.json   |  69 +++++
  .../fit-bounds-country-portrait/expected.png  | Bin 0 -> 4823 bytes
  .../fit-bounds-country-portrait/style.json    |  69 +++++
- 10 files changed, 710 insertions(+), 36 deletions(-)
+ 11 files changed, 714 insertions(+), 40 deletions(-)
  create mode 100644 src/ui/map_tests/map_fit_bounds_globe.test.ts
  create mode 100644 test/integration/render/tests/projection/globe/fit-bounds-country-landscape/expected.png
  create mode 100644 test/integration/render/tests/projection/globe/fit-bounds-country-landscape/style.json
@@ -794,6 +795,25 @@ index 0000000000000000000000000000000000000000..1cf19a3e0b7ee319f60aded0882d52d5
 +        map.remove();
 +    });
 +});
+diff --git a/test/build/bundle_size.json b/test/build/bundle_size.json
+index b677f89c1e4dcb27eb85d5fbc1f1914857cc2eba..2f57e633495654076f51787444d8137702514da8 100644
+--- a/test/build/bundle_size.json
++++ b/test/build/bundle_size.json
+@@ -1,10 +1,10 @@
+ {
+     "dist/maplibre-gl.mjs": {
+-        "raw": 1097968,
+-        "gzip": 294262
++        "raw": 1102565,
++        "gzip": 295790
+     },
+     "dist/maplibre-gl-worker.mjs": {
+-        "raw": 518806,
+-        "gzip": 148179
++        "raw": 518809,
++        "gzip": 148186
+     }
+ }
 diff --git a/test/integration/render/tests/projection/globe/fit-bounds-country-landscape/expected.png b/test/integration/render/tests/projection/globe/fit-bounds-country-landscape/expected.png
 new file mode 100644
 index 0000000000000000000000000000000000000000..c9dd62dc0f3f26917f8fbbeb51f6435b96e8a2ff
